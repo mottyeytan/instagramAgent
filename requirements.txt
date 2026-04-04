@@ -1,0 +1,9 @@
+deepface>=0.0.93
+instaloader>=4.13
+streamlit>=1.40
+Pillow>=10.0
+numpy>=1.26
+pytest>=8.0
+python-dotenv>=1.0
+requests>=2.31
+browser_cookie3>=0.19
