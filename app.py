@@ -206,10 +206,10 @@ with st.sidebar:
             )
             if result.get("last_error"):
                 st.warning(f"Scan ended early: {result['last_error']}")
-        except ValueError as e:
+        except (ValueError, ConnectionError) as e:
             st.error(str(e))
-        except ConnectionError as e:
-            st.error(str(e))
+        except Exception as e:
+            st.error(f"Scan failed: {type(e).__name__}: {e}")
 
     cached = get_cached_stats()
     if cached:

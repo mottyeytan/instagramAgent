@@ -1,6 +1,8 @@
 """Instagram scraping with inline face encoding using Chrome session cookies."""
 
+import re
 import sqlite3
+import tempfile
 import time
 import random
 import requests
@@ -149,13 +151,32 @@ def _get_following_page(session: requests.Session, user_id: str, count: int = 50
     return resp.json()
 
 
+_SAFE_USERNAME_RE = re.compile(r'^[a-zA-Z0-9._]+$')
+
+
+def _safe_photo_path(photos_dir: Path, username: str) -> Path:
+    """Build a safe photo path, rejecting usernames with path traversal characters."""
+    if not _SAFE_USERNAME_RE.match(username):
+        return photos_dir / "unknown.jpg"
+    return photos_dir / f"{username}.jpg"
+
+
 def _download_photo(session: requests.Session, url: str, save_path: Path) -> bool:
     if save_path.exists():
         return True
     try:
         resp = session.get(url, timeout=10)
         if resp.status_code == 200:
-            save_path.write_bytes(resp.content)
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                suffix=".jpg", dir=str(save_path.parent)
+            )
+            try:
+                with open(tmp_fd, "wb") as f:
+                    f.write(resp.content)
+                Path(tmp_path).rename(save_path)
+            except Exception:
+                Path(tmp_path).unlink(missing_ok=True)
+                raise
             return True
     except Exception:
         pass
@@ -205,6 +226,17 @@ def scrape_account(
     photos_path.mkdir(parents=True, exist_ok=True)
 
     conn = init_db(db_path)
+    try:
+        return _scrape_account_inner(conn, db_path, photos_path, delay_min, delay_max,
+                                     max_followers, batch_size, progress_callback,
+                                     batch_callback, target_username)
+    finally:
+        conn.close()
+
+
+def _scrape_account_inner(conn, db_path, photos_path, delay_min, delay_max,
+                          max_followers, batch_size, progress_callback,
+                          batch_callback, target_username):
     session = _get_session()
 
     user_id, total_followers, total_following = _get_user_id(session, target_username)
@@ -258,7 +290,7 @@ def scrape_account(
                 continue
 
             # Download profile photo
-            photo_path = photos_path / f"{username}.jpg"
+            photo_path = _safe_photo_path(photos_path, username)
             if pic_url and _download_photo(session, pic_url, photo_path):
                 embeddings = encode_primary_face(str(photo_path))
                 _save_profile(conn, username, full_name, "follower", str(photo_path), embeddings)
@@ -321,7 +353,7 @@ def scrape_account(
                     progress_callback(scraped_count, total_following, username)
                 continue
 
-            photo_path = photos_path / f"{username}.jpg"
+            photo_path = _safe_photo_path(photos_path, username)
             if pic_url and _download_photo(session, pic_url, photo_path):
                 embeddings = encode_primary_face(str(photo_path))
                 _save_profile(conn, username, full_name, "following", str(photo_path), embeddings)
@@ -345,7 +377,6 @@ def scrape_account(
         if not max_id:
             break
 
-    conn.close()
     return stats
 
 
@@ -354,7 +385,11 @@ def get_cached_stats(db_path: str = str(DB_PATH)) -> dict | None:
     if not db.exists():
         return None
 
-    conn = sqlite3.connect(db_path)
+    try:
+        conn = sqlite3.connect(db_path)
+    except sqlite3.DatabaseError:
+        return None
+
     try:
         total = conn.execute("SELECT COUNT(*) FROM profiles").fetchone()[0]
         if total == 0:
@@ -382,5 +417,7 @@ def get_cached_stats(db_path: str = str(DB_PATH)) -> dict | None:
             "mutuals": mutuals,
             "compatible": compatible,
         }
+    except sqlite3.DatabaseError:
+        return None
     finally:
         conn.close()
