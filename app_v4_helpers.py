@@ -1,125 +1,85 @@
-"""Pure helper functions for the V4 Investigation UI.
-
-These are extracted from app.py so they can be tested without a running
-Streamlit server.  Every function here is side-effect free (except
-save_uploaded_photos which writes to disk) and never imports Streamlit.
-"""
-
-from __future__ import annotations
+"""V4 helper functions for the Streamlit UI — SSE consumption and event formatting."""
 
 import json
-from pathlib import Path
-from typing import Any
+from typing import Generator
 
-import requests
+import httpx
 
-# ── Session state helpers ───────────────────────────────────────────────
+BACKEND_URL = "http://localhost:8000"
 
-_SESSION_DEFAULTS: dict[str, Any] = {
-    "investigation_running": False,
-    "activity_log": [],
-    "messages": [],
-    "investigation_id": None,
-}
-
-
-def init_session_state(state: dict[str, Any]) -> None:
-    """Populate *state* with default values for any missing keys."""
-    for key, default in _SESSION_DEFAULTS.items():
-        if key not in state:
-            # Use a fresh copy for mutable defaults to avoid sharing refs.
-            state[key] = default if not isinstance(default, (list, dict)) else type(default)()
-
-
-def set_investigation_running(
-    state: dict[str, Any],
-    running: bool,
-    *,
-    investigation_id: str | None = None,
-) -> None:
-    """Toggle the investigation-running flag and optionally set the id."""
-    state["investigation_running"] = running
-    if investigation_id is not None:
-        state["investigation_id"] = investigation_id
-
-
-# ── Activity / chat log helpers ─────────────────────────────────────────
-
-def append_activity_event(log: list[dict], event: dict) -> None:
-    """Append an activity event dict to *log*."""
-    log.append(event)
-
-
-def append_message(messages: list[dict], role: str, content: str) -> None:
-    """Append a chat message to *messages*."""
-    messages.append({"role": role, "content": content})
-
-
-# ── File I/O ────────────────────────────────────────────────────────────
-
-def save_uploaded_photos(
-    uploaded_files: list[Any],
-    *,
-    target_dir: Path = Path("data/input"),
-) -> list[Path]:
-    """Write each uploaded file to *target_dir* and return saved paths."""
-    if not uploaded_files:
-        return []
-
-    target_dir.mkdir(parents=True, exist_ok=True)
-
-    saved: list[Path] = []
-    for f in uploaded_files:
-        dest = target_dir / f.name
-        dest.write_bytes(f.getvalue())
-        saved.append(dest)
-    return saved
-
-
-# ── SSE parsing ─────────────────────────────────────────────────────────
 
 def parse_sse_event(line: str) -> dict | None:
-    """Parse a single SSE line.  Returns the parsed dict or ``None``."""
-    if not line.startswith("data:"):
+    """Parse a single SSE line into a dict. Returns None for non-data lines."""
+    if not line.startswith("data: "):
         return None
-    payload = line[len("data:"):].strip()
+    payload = line[6:].strip()
+    if not payload or payload == "[DONE]":
+        return None
     try:
         return json.loads(payload)
-    except (json.JSONDecodeError, ValueError):
+    except json.JSONDecodeError:
         return None
 
 
-# ── Event display formatting ────────────────────────────────────────────
+def consume_sse_stream(
+    url: str,
+    json_body: dict | None = None,
+    timeout: float = 600.0,
+) -> Generator[dict, None, None]:
+    """POST to an SSE endpoint and yield parsed events."""
+    with httpx.stream("POST", url, json=json_body, timeout=timeout) as response:
+        response.raise_for_status()
+        for line in response.iter_lines():
+            event = parse_sse_event(line)
+            if event is not None:
+                yield event
 
-_EVENT_ICONS: dict[str, str] = {
-    "progress": "...",
-    "match": "[match]",
-    "error": "[error]",
-    "done": "[done]",
-}
+
+def check_backend_health(timeout: float = 3.0) -> bool:
+    """Return True if the FastAPI backend is reachable and healthy."""
+    try:
+        resp = httpx.get(f"{BACKEND_URL}/health", timeout=timeout)
+        return resp.status_code == 200
+    except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPError):
+        return False
 
 
 def format_event_display(event: dict) -> str:
-    """Return a human-readable display string for an activity event."""
-    event_type = event.get("type", "info")
-    text = event.get("text", "")
-    icon = _EVENT_ICONS.get(event_type, f"[{event_type}]")
-    return f"{icon} {text}"
+    """Format an SSE event dict into a human-readable string for the activity feed."""
+    etype = event.get("type", "unknown")
 
+    if etype == "scanning":
+        username = event.get("username", "?")
+        platform = event.get("platform", "instagram")
+        return f"\U0001f50d Scanning @{username} on {platform}..."
 
-# ── Backend connectivity ────────────────────────────────────────────────
+    if etype == "found_leads":
+        count = event.get("count", 0)
+        platform = event.get("platform", "instagram")
+        return f"\U0001f4cb Found {count} leads on {platform}"
 
-def check_backend_health(base_url: str) -> dict:
-    """Probe ``{base_url}/health`` and return a status dict.
+    if etype == "face_matched":
+        username = event.get("username", "?")
+        score = event.get("score", 0)
+        return f"\u2705 MATCH: @{username} ({score}%)"
 
-    Returns ``{"healthy": True, "status": "ok"}`` on success or
-    ``{"healthy": False, "error": "<reason>"}`` on failure.
-    """
-    try:
-        resp = requests.get(f"{base_url}/health", timeout=3)
-        if resp.status_code == 200:
-            body = resp.json()
-            return {"healthy": True, "status": body.get("status", "ok")}
-        return {"healthy": False, "error": f"HTTP {resp.status_code}"}
-    except (requests.ConnectionError, requests.Timeout) as exc:
-        return {"healthy": False, "error": str(exc)}
+    if etype == "face_rejected":
+        username = event.get("username", "?")
+        score = event.get("score", 0)
+        return f"\u274c @{username} ({score}%)"
+
+    if etype == "budget_update":
+        spent = event.get("spent", 0)
+        total = event.get("total", 1)
+        return f"\U0001f4b0 Budget: {spent}/{total}"
+
+    if etype == "investigation_complete":
+        matches = event.get("matches_found", 0)
+        return f"\U0001f3c1 Investigation complete — {matches} matches found"
+
+    if etype == "interrupt":
+        question = event.get("question", "Agent needs input")
+        return f"\u2753 {question}"
+
+    # Fallback for unknown event types
+    return f"[{etype}] {json.dumps(event, default=str)}"

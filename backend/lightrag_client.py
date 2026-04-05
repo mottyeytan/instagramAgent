@@ -4,12 +4,18 @@ Handles: initialization, deterministic document IDs, cost tracking,
 insert/query helpers, and rebuild from SQLite.
 
 If lightrag is not installed, all methods degrade gracefully.
+If API keys are missing, the client is available but operations that
+need LLM/embedding calls will fail gracefully.
 """
+
+from __future__ import annotations
 
 import logging
 import os
 import shutil
 import sqlite3
+
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -17,13 +23,57 @@ logger = logging.getLogger(__name__)
 # Attempt to import lightrag at module level
 # ---------------------------------------------------------------------------
 try:
-    from lightrag import LightRAG
-    from lightrag.llm import QueryParam
+    from lightrag import LightRAG, QueryParam
+    from lightrag.utils import EmbeddingFunc
     _LIGHTRAG_AVAILABLE = True
 except ImportError:
     _LIGHTRAG_AVAILABLE = False
     LightRAG = None  # type: ignore[assignment,misc]
     QueryParam = None  # type: ignore[assignment,misc]
+    EmbeddingFunc = None  # type: ignore[assignment,misc]
+
+
+# ---------------------------------------------------------------------------
+# Factory functions for real LLM / embedding backends
+# ---------------------------------------------------------------------------
+
+def create_llm_func():
+    """Return an async callable that completes prompts via Claude Sonnet.
+
+    Requires ``ANTHROPIC_API_KEY`` in the environment.
+    """
+    from anthropic import Anthropic  # noqa: F811 – deferred import
+
+    client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+
+    async def llm_complete(prompt: str, **kwargs) -> str:
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=4096,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response.content[0].text
+
+    return llm_complete
+
+
+def create_embedding_func(
+    embedding_dim: int = 3072,
+    model: str = "text-embedding-3-large",
+):
+    """Return a :class:`~lightrag.utils.EmbeddingFunc` that calls OpenAI embeddings.
+
+    Requires ``OPENAI_API_KEY`` in the environment.
+    """
+    from openai import OpenAI  # noqa: F811 – deferred import
+
+    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
+
+    async def _embed(texts: list[str]) -> np.ndarray:
+        response = client.embeddings.create(model=model, input=texts)
+        return np.array([e.embedding for e in response.data])
+
+    return EmbeddingFunc(embedding_dim=embedding_dim, func=_embed)
 
 
 class LightRAGClient:
@@ -34,6 +84,8 @@ class LightRAGClient:
         working_dir: str,
         llm_func=None,
         embedding_func=None,
+        *,
+        auto_configure: bool = True,
     ):
         self._working_dir = working_dir
         self._available = False
@@ -44,6 +96,23 @@ class LightRAGClient:
         if not _LIGHTRAG_AVAILABLE:
             logger.warning("lightrag is not installed -- LightRAGClient disabled")
             return
+
+        # --- Auto-configure real backends when API keys are present ----------
+        if auto_configure and llm_func is None:
+            if os.environ.get("ANTHROPIC_API_KEY"):
+                try:
+                    llm_func = create_llm_func()
+                    logger.info("Auto-configured Claude Sonnet as LightRAG LLM backend")
+                except Exception:
+                    logger.warning("Failed to create LLM func -- continuing without it")
+
+        if auto_configure and embedding_func is None:
+            if os.environ.get("OPENAI_API_KEY"):
+                try:
+                    embedding_func = create_embedding_func()
+                    logger.info("Auto-configured OpenAI text-embedding-3-large as embedding backend")
+                except Exception:
+                    logger.warning("Failed to create embedding func -- continuing without it")
 
         try:
             kwargs: dict = {"working_dir": working_dir}

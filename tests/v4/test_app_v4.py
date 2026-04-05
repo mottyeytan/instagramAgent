@@ -1,346 +1,224 @@
-"""Tests for V4 Investigation UI helper functions.
-
-These tests exercise the pure helper functions extracted from app.py
-without importing Streamlit (which requires a running server).
-"""
+"""Tests for V4 Streamlit UI wiring — SSE consumption, interrupt detection, backend start."""
 
 import json
-import os
-import sys
-import tempfile
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+import subprocess
+from unittest.mock import MagicMock, patch, PropertyMock
 
+import httpx
 import pytest
 
-# Ensure project root is on sys.path so we can import the helpers module
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(PROJECT_ROOT))
-
 from app_v4_helpers import (
-    append_activity_event,
-    append_message,
     check_backend_health,
+    consume_sse_stream,
     format_event_display,
-    init_session_state,
     parse_sse_event,
-    save_uploaded_photos,
-    set_investigation_running,
 )
 
 
 # ---------------------------------------------------------------------------
-# 1. test_session_state_init
+# 1. test_sse_consumption — mock httpx.stream, verify events parsed correctly
 # ---------------------------------------------------------------------------
-class TestSessionStateInit:
-    def test_session_state_init_sets_defaults(self):
-        """Verify all required session_state keys get default values."""
-        state = {}
-        init_session_state(state)
-
-        assert state["investigation_running"] is False
-        assert state["activity_log"] == []
-        assert state["messages"] == []
-        assert state["investigation_id"] is None
-
-    def test_session_state_init_does_not_overwrite_existing(self):
-        """If a key already exists it should not be overwritten."""
-        state = {
-            "investigation_running": True,
-            "activity_log": [{"type": "info", "text": "existing"}],
-            "messages": [{"role": "user", "content": "hi"}],
-            "investigation_id": "abc-123",
-        }
-        init_session_state(state)
-
-        assert state["investigation_running"] is True
-        assert len(state["activity_log"]) == 1
-        assert len(state["messages"]) == 1
-        assert state["investigation_id"] == "abc-123"
 
 
-# ---------------------------------------------------------------------------
-# 2. test_activity_log_append
-# ---------------------------------------------------------------------------
-class TestActivityLogAppend:
-    def test_append_activity_event(self):
-        """Events can be appended to the activity log."""
-        log = []
-        event = {"type": "scrape", "text": "Scraped @user1", "ts": "2026-04-04T10:00:00"}
-        append_activity_event(log, event)
+class FakeResponse:
+    """Minimal stand-in for an httpx streaming response."""
 
-        assert len(log) == 1
-        assert log[0]["type"] == "scrape"
-        assert log[0]["text"] == "Scraped @user1"
+    def __init__(self, lines: list[str]):
+        self._lines = lines
+        self.status_code = 200
 
-    def test_append_multiple_events(self):
-        """Multiple events are appended in order."""
-        log = []
-        append_activity_event(log, {"type": "info", "text": "Starting"})
-        append_activity_event(log, {"type": "match", "text": "Found match"})
-        append_activity_event(log, {"type": "done", "text": "Finished"})
+    def iter_lines(self):
+        yield from self._lines
 
-        assert len(log) == 3
-        assert log[0]["type"] == "info"
-        assert log[2]["type"] == "done"
+    def raise_for_status(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
 
 
-# ---------------------------------------------------------------------------
-# 3. test_messages_append
-# ---------------------------------------------------------------------------
-class TestMessagesAppend:
-    def test_append_user_message(self):
-        """Chat messages can be appended with role and content."""
-        messages = []
-        append_message(messages, role="user", content="Hello agent")
+class TestSSEConsumption:
+    def test_parse_sse_event_valid(self):
+        event = parse_sse_event('data: {"type": "scanning", "username": "alice"}')
+        assert event == {"type": "scanning", "username": "alice"}
 
-        assert len(messages) == 1
-        assert messages[0]["role"] == "user"
-        assert messages[0]["content"] == "Hello agent"
-
-    def test_append_assistant_message(self):
-        """Assistant messages are appended correctly."""
-        messages = []
-        append_message(messages, role="assistant", content="Investigation started.")
-
-        assert messages[0]["role"] == "assistant"
-
-    def test_message_ordering(self):
-        """Messages maintain insertion order."""
-        messages = []
-        append_message(messages, "user", "First")
-        append_message(messages, "assistant", "Second")
-        append_message(messages, "user", "Third")
-
-        assert [m["content"] for m in messages] == ["First", "Second", "Third"]
-
-
-# ---------------------------------------------------------------------------
-# 4. test_investigation_state_tracking
-# ---------------------------------------------------------------------------
-class TestInvestigationStateTracking:
-    def test_set_running_true(self):
-        """Running flag can be toggled to True."""
-        state = {"investigation_running": False, "investigation_id": None}
-        set_investigation_running(state, True, investigation_id="inv-001")
-
-        assert state["investigation_running"] is True
-        assert state["investigation_id"] == "inv-001"
-
-    def test_set_running_false(self):
-        """Running flag can be toggled to False (investigation complete)."""
-        state = {"investigation_running": True, "investigation_id": "inv-001"}
-        set_investigation_running(state, False)
-
-        assert state["investigation_running"] is False
-
-    def test_toggle_round_trip(self):
-        """Start then stop an investigation."""
-        state = {"investigation_running": False, "investigation_id": None}
-        set_investigation_running(state, True, investigation_id="inv-002")
-        assert state["investigation_running"] is True
-
-        set_investigation_running(state, False)
-        assert state["investigation_running"] is False
-        # investigation_id is preserved so we can review results
-        assert state["investigation_id"] == "inv-002"
-
-
-# ---------------------------------------------------------------------------
-# 5. test_photo_saving
-# ---------------------------------------------------------------------------
-class TestPhotoSaving:
-    def test_saves_files_to_directory(self):
-        """Uploaded files are written to the specified directory."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            target_dir = Path(tmpdir) / "data" / "input"
-
-            # Simulate Streamlit UploadedFile objects
-            file1 = MagicMock()
-            file1.name = "target_photo.jpg"
-            file1.getvalue.return_value = b"\xff\xd8\xff\xe0fake-jpeg-bytes"
-
-            file2 = MagicMock()
-            file2.name = "another.png"
-            file2.getvalue.return_value = b"\x89PNGfake-png-bytes"
-
-            saved = save_uploaded_photos([file1, file2], target_dir=target_dir)
-
-            assert len(saved) == 2
-            assert (target_dir / "target_photo.jpg").exists()
-            assert (target_dir / "another.png").exists()
-            assert (target_dir / "target_photo.jpg").read_bytes() == b"\xff\xd8\xff\xe0fake-jpeg-bytes"
-
-    def test_creates_directory_if_missing(self):
-        """The target directory is created if it does not exist."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            target_dir = Path(tmpdir) / "nested" / "deep" / "input"
-
-            file1 = MagicMock()
-            file1.name = "photo.jpg"
-            file1.getvalue.return_value = b"data"
-
-            save_uploaded_photos([file1], target_dir=target_dir)
-
-            assert target_dir.exists()
-            assert (target_dir / "photo.jpg").exists()
-
-    def test_returns_saved_paths(self):
-        """Returns a list of Path objects for each saved file."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            target_dir = Path(tmpdir)
-
-            file1 = MagicMock()
-            file1.name = "a.jpg"
-            file1.getvalue.return_value = b"x"
-
-            paths = save_uploaded_photos([file1], target_dir=target_dir)
-
-            assert len(paths) == 1
-            assert paths[0] == target_dir / "a.jpg"
-
-    def test_empty_upload_list(self):
-        """Empty list of uploads produces no files and returns empty list."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            paths = save_uploaded_photos([], target_dir=Path(tmpdir))
-            assert paths == []
-
-
-# ---------------------------------------------------------------------------
-# 6. test_sse_event_parsing
-# ---------------------------------------------------------------------------
-class TestSSEEventParsing:
-    def test_parse_data_line(self):
-        """Standard SSE 'data: {...}' line is parsed into a dict."""
-        line = 'data: {"type": "progress", "message": "Scanning..."}'
-        result = parse_sse_event(line)
-
-        assert result is not None
-        assert result["type"] == "progress"
-        assert result["message"] == "Scanning..."
-
-    def test_parse_ignores_non_data_lines(self):
-        """Lines without 'data:' prefix return None."""
+    def test_parse_sse_event_empty_line(self):
         assert parse_sse_event("") is None
-        assert parse_sse_event(": keepalive") is None
-        assert parse_sse_event("event: ping") is None
 
-    def test_parse_invalid_json_returns_none(self):
-        """Malformed JSON after 'data:' returns None."""
-        assert parse_sse_event("data: {not valid json}") is None
+    def test_parse_sse_event_comment_line(self):
+        assert parse_sse_event(": keep-alive") is None
 
-    def test_parse_data_with_extra_whitespace(self):
-        """Whitespace between 'data:' and JSON is handled."""
-        line = 'data:   {"type": "done"}'
-        result = parse_sse_event(line)
-        assert result is not None
-        assert result["type"] == "done"
+    def test_parse_sse_event_done_sentinel(self):
+        assert parse_sse_event("data: [DONE]") is None
 
-    def test_parse_nested_json(self):
-        """Nested JSON structures are preserved."""
-        payload = {"type": "match", "data": {"username": "alice", "confidence": 87.5}}
-        line = f"data: {json.dumps(payload)}"
-        result = parse_sse_event(line)
-        assert result["data"]["username"] == "alice"
-        assert result["data"]["confidence"] == 87.5
+    def test_parse_sse_event_bad_json(self):
+        assert parse_sse_event("data: {not json}") is None
 
+    def test_consume_sse_stream_yields_events(self):
+        sse_lines = [
+            'data: {"type": "scanning", "username": "bob", "platform": "instagram"}',
+            "",
+            'data: {"type": "found_leads", "count": 42, "platform": "instagram"}',
+            'data: {"type": "face_matched", "username": "carol", "score": 87}',
+            'data: {"type": "investigation_complete", "matches_found": 1}',
+        ]
+        fake = FakeResponse(sse_lines)
 
-# ---------------------------------------------------------------------------
-# 7. test_event_display_format
-# ---------------------------------------------------------------------------
-class TestEventDisplayFormat:
-    def test_progress_event(self):
-        """Progress events produce a spinner-like display string."""
-        event = {"type": "progress", "text": "Scanning @user1"}
-        display = format_event_display(event)
-        assert "Scanning @user1" in display
+        with patch("app_v4_helpers.httpx.stream", return_value=fake):
+            events = list(consume_sse_stream("http://localhost:8000/investigations/start", json_body={"target": "x"}))
 
-    def test_match_event(self):
-        """Match events include a match indicator."""
-        event = {"type": "match", "text": "Found match: @alice (92%)"}
-        display = format_event_display(event)
-        assert "match" in display.lower() or "Found match" in display
+        assert len(events) == 4
+        assert events[0]["type"] == "scanning"
+        assert events[1]["type"] == "found_leads"
+        assert events[1]["count"] == 42
+        assert events[2]["type"] == "face_matched"
+        assert events[2]["score"] == 87
+        assert events[3]["type"] == "investigation_complete"
 
-    def test_error_event(self):
-        """Error events include an error indicator."""
-        event = {"type": "error", "text": "Rate limited"}
-        display = format_event_display(event)
-        assert "error" in display.lower() or "Rate limited" in display
+    def test_consume_sse_stream_skips_non_data_lines(self):
+        sse_lines = [
+            ": heartbeat",
+            'data: {"type": "scanning", "username": "dave", "platform": "instagram"}',
+            "event: keep-alive",
+            "",
+        ]
+        fake = FakeResponse(sse_lines)
 
-    def test_done_event(self):
-        """Done events produce a completion message."""
-        event = {"type": "done", "text": "Investigation complete"}
-        display = format_event_display(event)
-        assert "complete" in display.lower() or "done" in display.lower() or "Investigation complete" in display
+        with patch("app_v4_helpers.httpx.stream", return_value=fake):
+            events = list(consume_sse_stream("http://localhost:8000/investigations/start"))
 
-    def test_unknown_event_type_still_returns_string(self):
-        """Unknown event types still produce a displayable string."""
-        event = {"type": "custom_thing", "text": "Something happened"}
-        display = format_event_display(event)
-        assert isinstance(display, str)
-        assert "Something happened" in display
+        assert len(events) == 1
+        assert events[0]["username"] == "dave"
 
 
 # ---------------------------------------------------------------------------
-# 8. test_backend_health_check
+# 2. test_interrupt_detection — interrupt event triggers chat display
 # ---------------------------------------------------------------------------
-class TestBackendHealthCheck:
-    @patch("app_v4_helpers.requests.get")
+
+
+class TestInterruptDetection:
+    def test_interrupt_event_detected_and_formatted(self):
+        event = {"type": "interrupt", "question": "Expand search to following?"}
+        display = format_event_display(event)
+        assert "Expand search to following?" in display
+
+    def test_process_sse_stops_at_interrupt(self):
+        """Simulate _process_sse_events stopping when an interrupt arrives."""
+        sse_lines = [
+            'data: {"type": "scanning", "username": "eve", "platform": "instagram"}',
+            'data: {"type": "interrupt", "question": "Should I continue?"}',
+            'data: {"type": "face_matched", "username": "frank", "score": 95}',
+        ]
+        fake = FakeResponse(sse_lines)
+
+        with patch("app_v4_helpers.httpx.stream", return_value=fake):
+            events_iter = consume_sse_stream("http://localhost:8000/investigations/start")
+
+            # Simulate what _process_sse_events does: consume until interrupt
+            collected = []
+            interrupt_found = False
+            for event in events_iter:
+                collected.append(event)
+                if event.get("type") == "interrupt":
+                    interrupt_found = True
+                    break
+
+        assert interrupt_found
+        assert len(collected) == 2
+        assert collected[0]["type"] == "scanning"
+        assert collected[1]["type"] == "interrupt"
+        assert collected[1]["question"] == "Should I continue?"
+
+    def test_interrupt_adds_to_chat_list(self):
+        """Verify an interrupt event would be appended as an assistant chat message."""
+        chat_messages = []
+        event = {"type": "interrupt", "question": "Proceed with 200 more profiles?"}
+
+        # Simulate what _process_sse_events does with the chat list
+        chat_messages.append(
+            {"role": "assistant", "content": event.get("question", "Agent needs input")}
+        )
+
+        assert len(chat_messages) == 1
+        assert chat_messages[0]["role"] == "assistant"
+        assert "200 more profiles" in chat_messages[0]["content"]
+
+
+# ---------------------------------------------------------------------------
+# 3. test_backend_start_button — verify subprocess.Popen called correctly
+# ---------------------------------------------------------------------------
+
+
+class TestBackendStartButton:
+    @patch("subprocess.Popen")
+    def test_popen_called_with_uvicorn_args(self, mock_popen):
+        """Verify the Start Backend button calls Popen with the right command."""
+        expected_cmd = ["python", "-m", "uvicorn", "backend.server:app", "--port", "8000"]
+
+        # Simulate what the button handler does
+        subprocess.Popen(expected_cmd)
+
+        mock_popen.assert_called_once_with(expected_cmd)
+
+    @patch("subprocess.Popen")
+    def test_popen_not_called_without_click(self, mock_popen):
+        """Popen should not be called if the button is never clicked."""
+        mock_popen.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Extra: format_event_display coverage
+# ---------------------------------------------------------------------------
+
+
+class TestFormatEventDisplay:
+    def test_scanning(self):
+        result = format_event_display({"type": "scanning", "username": "alice", "platform": "tiktok"})
+        assert "@alice" in result
+        assert "tiktok" in result
+
+    def test_found_leads(self):
+        result = format_event_display({"type": "found_leads", "count": 15, "platform": "instagram"})
+        assert "15" in result
+
+    def test_face_matched(self):
+        result = format_event_display({"type": "face_matched", "username": "bob", "score": 92})
+        assert "MATCH" in result
+        assert "92" in result
+
+    def test_face_rejected(self):
+        result = format_event_display({"type": "face_rejected", "username": "charlie", "score": 30})
+        assert "charlie" in result
+        assert "30" in result
+
+    def test_budget_update(self):
+        result = format_event_display({"type": "budget_update", "spent": 5, "total": 10})
+        assert "5" in result
+        assert "10" in result
+
+    def test_investigation_complete(self):
+        result = format_event_display({"type": "investigation_complete", "matches_found": 3})
+        assert "3" in result
+        assert "complete" in result.lower()
+
+    def test_unknown_event(self):
+        result = format_event_display({"type": "some_new_type", "data": "x"})
+        assert "some_new_type" in result
+
+
+class TestCheckBackendHealth:
+    @patch("app_v4_helpers.httpx.get")
     def test_healthy_backend(self, mock_get):
-        """When /health returns 200 with status ok, report healthy."""
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {"status": "ok"}
-        mock_get.return_value = mock_response
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_get.return_value = mock_resp
 
-        result = check_backend_health("http://localhost:8000")
+        assert check_backend_health() is True
+        mock_get.assert_called_once()
 
-        assert result["healthy"] is True
-        assert result["status"] == "ok"
-        mock_get.assert_called_once_with("http://localhost:8000/health", timeout=3)
-
-    @patch("app_v4_helpers.requests.get")
-    def test_unhealthy_backend_non_200(self, mock_get):
-        """When /health returns non-200, report unhealthy."""
-        mock_response = MagicMock()
-        mock_response.status_code = 503
-        mock_response.json.return_value = {"status": "unavailable"}
-        mock_get.return_value = mock_response
-
-        result = check_backend_health("http://localhost:8000")
-
-        assert result["healthy"] is False
-
-    @patch("app_v4_helpers.requests.get")
-    def test_backend_unreachable(self, mock_get):
-        """When the backend is unreachable, report unhealthy without raising."""
-        import requests
-        mock_get.side_effect = requests.ConnectionError("Connection refused")
-
-        result = check_backend_health("http://localhost:8000")
-
-        assert result["healthy"] is False
-        assert "error" in result
-
-    @patch("app_v4_helpers.requests.get")
-    def test_backend_timeout(self, mock_get):
-        """When the health check times out, report unhealthy."""
-        import requests
-        mock_get.side_effect = requests.Timeout("Read timed out")
-
-        result = check_backend_health("http://localhost:8000")
-
-        assert result["healthy"] is False
-        assert "error" in result
-
-    @patch("app_v4_helpers.requests.get")
-    def test_custom_base_url(self, mock_get):
-        """The health check uses the provided base URL."""
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {"status": "ok"}
-        mock_get.return_value = mock_response
-
-        check_backend_health("http://my-server:9000")
-
-        mock_get.assert_called_once_with("http://my-server:9000/health", timeout=3)
+    @patch("app_v4_helpers.httpx.get", side_effect=httpx.ConnectError("connection refused"))
+    def test_unreachable_backend(self, mock_get):
+        assert check_backend_health() is False

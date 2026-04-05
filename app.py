@@ -1,27 +1,24 @@
-"""Instagram Face Matcher — Streamlit UI (V4 + Legacy)."""
+"""Instagram Face Matcher — Streamlit UI."""
 
+import subprocess
+import uuid
+from pathlib import Path
+
+import numpy as np
 import streamlit as st
 from PIL import Image, ImageDraw
-import numpy as np
-from pathlib import Path
 
 from encoder import encode_faces, detect_face_locations, warmup
 from matcher import find_matches, cosine_distance, Match
 from scraper import scrape_account, get_cached_stats, DB_PATH, PHOTOS_DIR
-
 from app_v4_helpers import (
-    init_session_state,
-    set_investigation_running,
-    append_activity_event,
-    append_message,
-    save_uploaded_photos,
-    parse_sse_event,
-    format_event_display,
+    BACKEND_URL,
     check_backend_health,
+    consume_sse_stream,
+    format_event_display,
 )
 
 INPUT_DIR = Path("data/input")
-BACKEND_URL = "http://localhost:8000"
 
 st.set_page_config(page_title="Instagram Face Matcher", layout="wide")
 
@@ -30,12 +27,6 @@ if "model_ready" not in st.session_state:
     with st.spinner("Loading face recognition model..."):
         warmup()
     st.session_state.model_ready = True
-
-# Initialize V4 session state
-init_session_state(st.session_state)
-
-
-# ── Shared helpers (used by legacy UI) ──────────────────────────────────
 
 
 def draw_face_boxes(image: Image.Image, locations: list[dict]) -> Image.Image:
@@ -116,275 +107,340 @@ def detect_input_faces():
     return all_faces, unique_faces
 
 
-# ── V4 Investigation UI ────────────────────────────────────────────────
-
-
-def start_investigation_ui(target, seed_username, uploaded_photos, time_limit):
-    """Kick off an investigation in standalone or connected mode."""
-    # Save uploaded photos
-    if uploaded_photos:
-        saved = save_uploaded_photos(uploaded_photos, target_dir=INPUT_DIR)
-        append_activity_event(
-            st.session_state.activity_log,
-            {"type": "info", "text": f"Saved {len(saved)} photo(s) to {INPUT_DIR}"},
-        )
-
-    # Check backend connectivity
-    health = check_backend_health(BACKEND_URL)
-
-    if health["healthy"]:
-        # Connected mode — stream from FastAPI backend
-        set_investigation_running(st.session_state, True, investigation_id="connected")
-        append_activity_event(
-            st.session_state.activity_log,
-            {"type": "info", "text": "Connected to backend. Starting investigation via API..."},
-        )
-        st.info("Backend connected. SSE streaming will appear here once the backend API is implemented.")
-    else:
-        # Standalone mode — run directly
-        set_investigation_running(st.session_state, True, investigation_id="standalone")
-        append_activity_event(
-            st.session_state.activity_log,
-            {"type": "info", "text": f"Backend not available ({health.get('error', 'unknown')}). Running standalone."},
-        )
-        append_activity_event(
-            st.session_state.activity_log,
-            {"type": "progress", "text": f"Standalone investigation: target={target}, seed=@{seed_username}, limit={time_limit}m"},
-        )
-
-        # In standalone mode, fall back to the existing scrape + match pipeline
-        if seed_username:
-            username = seed_username.lstrip("@")
-            try:
-                result = scrape_account(target_username=username, batch_size=50)
-                append_activity_event(
-                    st.session_state.activity_log,
-                    {
-                        "type": "done",
-                        "text": (
-                            f"Scan complete: {result['followers_scraped']} followers, "
-                            f"{result['following_scraped']} following, "
-                            f"{result['faces_found']} faces."
-                        ),
-                    },
-                )
-            except Exception as exc:
-                append_activity_event(
-                    st.session_state.activity_log,
-                    {"type": "error", "text": f"Scan failed: {exc}"},
-                )
-        else:
-            append_activity_event(
-                st.session_state.activity_log,
-                {"type": "error", "text": "No seed username provided."},
-            )
-
-        set_investigation_running(st.session_state, False)
-
-
-def render_v4_ui():
-    """Render the V4 split-screen investigation UI."""
-    st.title("AI Investigation Agent")
-
-    # Sidebar: investigation controls
-    with st.sidebar:
-        st.header("New Investigation")
-        target = st.text_input(
-            "Target description",
-            placeholder="e.g., Find people connected to @username",
-        )
-        seed_username = st.text_input(
-            "Seed Instagram username",
-            placeholder="@username",
-        )
-
-        uploaded_photos = st.file_uploader(
-            "Upload target photos",
-            type=["jpg", "jpeg", "png"],
-            accept_multiple_files=True,
-        )
-
-        time_limit = st.slider("Time limit (minutes)", 1, 30, 10)
-
-        if st.button("Start Investigation", type="primary"):
-            start_investigation_ui(target, seed_username, uploaded_photos, time_limit)
-
-    # Main area: split-screen
-    col_activity, col_chat = st.columns([1, 1])
-
-    with col_activity:
-        st.subheader("Agent Activity")
-        activity_container = st.container(height=500)
-        with activity_container:
-            if not st.session_state.activity_log:
-                st.caption("No activity yet. Start an investigation from the sidebar.")
-            else:
-                for event in st.session_state.activity_log:
-                    display = format_event_display(event)
-                    event_type = event.get("type", "info")
-                    if event_type == "error":
-                        st.error(display)
-                    elif event_type == "match":
-                        st.success(display)
-                    elif event_type == "done":
-                        st.info(display)
-                    else:
-                        st.write(display)
-
-    with col_chat:
-        st.subheader("Chat")
-        chat_container = st.container(height=400)
-        with chat_container:
-            for msg in st.session_state.messages:
-                with st.chat_message(msg["role"]):
-                    st.write(msg["content"])
-
-        user_input = st.chat_input("Talk to the agents...")
-        if user_input:
-            append_message(st.session_state.messages, "user", user_input)
-            # Echo a placeholder response (real agent chat comes with full backend)
-            append_message(
-                st.session_state.messages,
-                "assistant",
-                "Agent chat is not yet connected. Investigation results appear in the Activity panel.",
-            )
-            st.rerun()
-
-
-# ── Legacy Scanner UI ──────────────────────────────────────────────────
-
-
-def render_legacy_ui():
-    """The original V1 scanner interface."""
-    st.title("Instagram Face Matcher")
-
+def render_v3_ui():
+    """Render the classic V3 face-matching UI."""
     # Detect faces FIRST (cached, runs once)
-    input_photos = (
-        list(INPUT_DIR.glob("*.jpg"))
-        + list(INPUT_DIR.glob("*.jpeg"))
-        + list(INPUT_DIR.glob("*.png"))
-    )
+    input_photos = list(INPUT_DIR.glob("*.jpg")) + list(INPUT_DIR.glob("*.jpeg")) + list(INPUT_DIR.glob("*.png"))
 
     if not input_photos:
         st.info("No photos found. Drop your photos into `data/input/` and refresh.")
-        unique_faces = []
+        return
+
+    all_faces, unique_faces = detect_input_faces()
+
+    # Show photos in a compact row
+    st.subheader(f"{len(input_photos)} photos — {len(unique_faces)} unique people detected")
+    cols = st.columns(min(len(input_photos), 6))
+    for i, photo_path in enumerate(sorted(input_photos)):
+        with cols[i % len(cols)]:
+            img = Image.open(photo_path)
+            locations = detect_face_locations(str(photo_path))
+            if locations:
+                img = draw_face_boxes(img, locations)
+            st.image(img, caption=f"{len(locations)} face(s)", width="stretch")
+
+    if unique_faces:
+        for face in unique_faces:
+            st.caption(f"Person {face['person_id']}: seen in {', '.join(face['source_files'])}")
+
+    st.divider()
+
+    # FIND MATCHES — always visible
+    stats = get_cached_stats()
+    cache_incompatible = bool(stats and not stats.get("compatible", True))
+    if stats:
+        if cache_incompatible:
+            st.error(
+                "Cached profile data was built with an older face pipeline. "
+                "Delete `data/faces.db` and `data/photos/`, then scan again."
+            )
+        else:
+            st.success(f"**{stats['total']}** profiles cached ({stats['with_face']} with faces)")
+
+    if st.button("Find Matches", type="primary", disabled=not unique_faces or cache_incompatible):
+        if not Path(str(DB_PATH)).exists() or not stats:
+            st.warning("No cached data yet. Start a scan in the sidebar first.")
+        elif cache_incompatible:
+            st.warning("Cached data must be rebuilt before matching can run.")
+        else:
+            embeddings = [f["embedding"] for f in unique_faces]
+            matches = find_matches(embeddings, str(DB_PATH))
+
+            for face, face_matches in zip(unique_faces, matches):
+                st.divider()
+                st.subheader(f"Person {face['person_id']}")
+                st.caption(f"Seen in: {', '.join(face['source_files'])}")
+
+                col_photo, col_matches = st.columns([1, 2])
+                with col_photo:
+                    src_img = Image.open(face["image_path"])
+                    src_locations = detect_face_locations(face["image_path"])
+                    if src_locations:
+                        src_img = draw_face_boxes(src_img, src_locations)
+                    st.image(src_img, width="stretch")
+
+                with col_matches:
+                    if face_matches:
+                        for m in face_matches:
+                            render_match_card(m)
+                            st.write("")
+                    else:
+                        st.info("No confident matches found.")
+
+# Sidebar: scan controls (non-blocking for the main content)
+with st.sidebar:
+    st.header("Scan Instagram")
+
+    target = st.text_input("Username to search", value="aardvarkisrael")
+
+    batch_size = st.number_input("Batch size", min_value=10, max_value=500, value=50, step=10)
+
+    if st.button("Scan Network", disabled=not target):
+        progress_bar = st.progress(0, text="Starting scan...")
+        status_text = st.empty()
+        batch_text = st.empty()
+
+        def on_progress(current, total, username):
+            pct = current / max(total, 1)
+            progress_bar.progress(pct, text=f"Scanning {current}/{total}")
+            status_text.caption(f"@{username}")
+
+        def on_batch(batch_stats):
+            total_s = batch_stats["followers_scraped"] + batch_stats["following_scraped"]
+            batch_text.success(f"{total_s} scanned, {batch_stats['faces_found']} faces. Click 'Find Matches' now!")
+
+        try:
+            result = scrape_account(
+                target_username=target,
+                batch_size=batch_size,
+                progress_callback=on_progress,
+                batch_callback=on_batch,
+            )
+            st.success(
+                f"Done! {result['followers_scraped']} followers, "
+                f"{result['following_scraped']} following. "
+                f"{result['faces_found']} faces found."
+            )
+            if result.get("last_error"):
+                st.warning(f"Scan ended early: {result['last_error']}")
+        except (ValueError, ConnectionError) as e:
+            st.error(str(e))
+        except Exception as e:
+            st.error(f"Scan failed: {type(e).__name__}: {e}")
+
+    cached = get_cached_stats()
+    if cached:
+        if cached.get("compatible", True):
+            st.caption(f"Cached: {cached['total']} profiles | {cached['with_face']} faces")
+        else:
+            st.caption(f"Cached: {cached['total']} profiles | reset required")
+
+    # --- Backend control ---
+    st.divider()
+    st.header("V4 Backend")
+    if st.button("Start Backend", key="start_backend"):
+        subprocess.Popen(
+            ["python", "-m", "uvicorn", "backend.server:app", "--port", "8000"]
+        )
+        st.success("Backend starting on port 8000...")
+
+
+# ---------------------------------------------------------------------------
+# V4 Agent UI
+# ---------------------------------------------------------------------------
+
+
+def _init_v4_session_state():
+    """Ensure all V4 session-state keys exist."""
+    if "v4_activity" not in st.session_state:
+        st.session_state.v4_activity = []
+    if "v4_chat" not in st.session_state:
+        st.session_state.v4_chat = []
+    if "v4_investigation_id" not in st.session_state:
+        st.session_state.v4_investigation_id = None
+    if "v4_waiting_interrupt" not in st.session_state:
+        st.session_state.v4_waiting_interrupt = False
+    if "v4_interrupt_event" not in st.session_state:
+        st.session_state.v4_interrupt_event = None
+    if "v4_complete" not in st.session_state:
+        st.session_state.v4_complete = False
+
+
+def _render_activity_event(event: dict):
+    """Render a single event in the activity feed column."""
+    etype = event.get("type", "unknown")
+
+    if etype == "scanning":
+        username = event.get("username", "?")
+        platform = event.get("platform", "instagram")
+        st.info(f"\U0001f50d Scanning @{username} on {platform}...")
+
+    elif etype == "found_leads":
+        count = event.get("count", 0)
+        platform = event.get("platform", "instagram")
+        st.success(f"\U0001f4cb Found {count} leads on {platform}")
+
+    elif etype == "face_matched":
+        username = event.get("username", "?")
+        score = event.get("score", 0)
+        photo = event.get("photo_path")
+        cols = st.columns([1, 4])
+        with cols[0]:
+            if photo and Path(photo).exists():
+                st.image(photo, width=48)
+        with cols[1]:
+            st.success(f"\u2705 MATCH: @{username} ({score}%)")
+
+    elif etype == "face_rejected":
+        username = event.get("username", "?")
+        score = event.get("score", 0)
+        st.markdown(
+            f"<span style='opacity:0.45'>\u274c @{username} ({score}%)</span>",
+            unsafe_allow_html=True,
+        )
+
+    elif etype == "budget_update":
+        spent = event.get("spent", 0)
+        total = event.get("total", 1)
+        pct = min(spent / max(total, 1), 1.0)
+        st.progress(pct, text=f"Budget: {spent}/{total}")
+
+    elif etype == "investigation_complete":
+        matches = event.get("matches_found", 0)
+        st.balloons()
+        st.success(f"\U0001f3c1 Investigation complete — {matches} matches found")
+
     else:
-        all_faces, unique_faces = detect_input_faces()
+        st.write(format_event_display(event))
 
-        # Show photos in a compact row
-        st.subheader(f"{len(input_photos)} photos — {len(unique_faces)} unique people detected")
-        cols = st.columns(min(len(input_photos), 6))
-        for i, photo_path in enumerate(sorted(input_photos)):
-            with cols[i % len(cols)]:
-                img = Image.open(photo_path)
-                locations = detect_face_locations(str(photo_path))
-                if locations:
-                    img = draw_face_boxes(img, locations)
-                st.image(img, caption=f"{len(locations)} face(s)", width="stretch")
 
-        if unique_faces:
-            for face in unique_faces:
-                st.caption(f"Person {face['person_id']}: seen in {', '.join(face['source_files'])}")
+def _process_sse_events(events_iter):
+    """Consume an SSE event iterator, updating session state for each event."""
+    for event in events_iter:
+        st.session_state.v4_activity.append(event)
+        etype = event.get("type", "unknown")
 
-        st.divider()
+        if etype == "interrupt":
+            st.session_state.v4_waiting_interrupt = True
+            st.session_state.v4_interrupt_event = event
+            st.session_state.v4_chat.append(
+                {"role": "assistant", "content": event.get("question", "Agent needs input")}
+            )
+            # Stop consuming — we need user input before continuing
+            return
 
-        # FIND MATCHES — always visible
-        stats = get_cached_stats()
-        cache_incompatible = bool(stats and not stats.get("compatible", True))
-        if stats:
-            if cache_incompatible:
-                st.error(
-                    "Cached profile data was built with an older face pipeline. "
-                    "Delete `data/faces.db` and `data/photos/`, then scan again."
-                )
+        if etype == "investigation_complete":
+            st.session_state.v4_complete = True
+
+
+def render_v4_ui():
+    """Render the V4 agent-based investigation UI."""
+    _init_v4_session_state()
+
+    backend_ok = check_backend_health()
+    if not backend_ok:
+        st.warning(
+            "V4 backend is not running. Click **Start Backend** in the sidebar, "
+            "or run `uvicorn backend.server:app --port 8000` manually. "
+            "Falling back to direct investigation mode."
+        )
+
+    # --- Layout: left = activity feed, right = chat ---
+    col_activity, col_chat = st.columns([3, 2])
+
+    # ----- LEFT: Activity Feed -----
+    with col_activity:
+        st.subheader("Activity Feed")
+
+        # Upload photos
+        uploaded_files = st.file_uploader(
+            "Upload reference photos",
+            type=["jpg", "jpeg", "png"],
+            accept_multiple=True,
+            key="v4_upload",
+        )
+
+        target = st.text_input("Target username", value="", key="v4_target")
+
+        if st.button("Start Investigation", type="primary", key="v4_start"):
+            if not uploaded_files:
+                st.error("Upload at least one reference photo.")
+            elif not target:
+                st.error("Enter a target username.")
+            elif not backend_ok:
+                st.error("Backend is not running. Start it from the sidebar first.")
             else:
-                st.success(f"**{stats['total']}** profiles cached ({stats['with_face']} with faces)")
+                # Save uploaded files to data/input/
+                INPUT_DIR.mkdir(parents=True, exist_ok=True)
+                photo_paths = []
+                for uf in uploaded_files:
+                    dest = INPUT_DIR / uf.name
+                    dest.write_bytes(uf.getbuffer())
+                    photo_paths.append(str(dest))
 
-        if st.button("Find Matches", type="primary", disabled=not unique_faces or cache_incompatible):
-            if not Path(str(DB_PATH)).exists() or not stats:
-                st.warning("No cached data yet. Start a scan in the sidebar first.")
-            elif cache_incompatible:
-                st.warning("Cached data must be rebuilt before matching can run.")
+                # Reset state
+                st.session_state.v4_activity = []
+                st.session_state.v4_chat = []
+                st.session_state.v4_waiting_interrupt = False
+                st.session_state.v4_interrupt_event = None
+                st.session_state.v4_complete = False
+
+                inv_id = str(uuid.uuid4())
+                st.session_state.v4_investigation_id = inv_id
+
+                start_url = f"{BACKEND_URL}/investigations/start"
+                body = {
+                    "investigation_id": inv_id,
+                    "target_username": target,
+                    "photo_paths": photo_paths,
+                }
+
+                try:
+                    events = consume_sse_stream(start_url, json_body=body)
+                    _process_sse_events(events)
+                except Exception as exc:
+                    st.error(f"Backend error: {exc}")
+
+        # Render accumulated events
+        for ev in st.session_state.v4_activity:
+            _render_activity_event(ev)
+
+    # ----- RIGHT: Chat Panel -----
+    with col_chat:
+        st.subheader("Chat")
+
+        # Show chat history
+        for msg in st.session_state.v4_chat:
+            with st.chat_message(msg["role"]):
+                st.write(msg["content"])
+
+        # Chat input
+        user_input = st.chat_input("Type a message...", key="v4_chat_input")
+        if user_input:
+            st.session_state.v4_chat.append({"role": "user", "content": user_input})
+
+            if st.session_state.v4_waiting_interrupt and st.session_state.v4_investigation_id:
+                # Resume the investigation
+                inv_id = st.session_state.v4_investigation_id
+                resume_url = f"{BACKEND_URL}/investigations/{inv_id}/resume"
+                body = {"response": user_input}
+
+                st.session_state.v4_waiting_interrupt = False
+                st.session_state.v4_interrupt_event = None
+
+                try:
+                    events = consume_sse_stream(resume_url, json_body=body)
+                    _process_sse_events(events)
+                except Exception as exc:
+                    st.error(f"Backend error: {exc}")
+
+                st.rerun()
             else:
-                embeddings = [f["embedding"] for f in unique_faces]
-                matches = find_matches(embeddings, str(DB_PATH))
-
-                for face, face_matches in zip(unique_faces, matches):
-                    st.divider()
-                    st.subheader(f"Person {face['person_id']}")
-                    st.caption(f"Seen in: {', '.join(face['source_files'])}")
-
-                    col_photo, col_matches = st.columns([1, 2])
-                    with col_photo:
-                        src_img = Image.open(face["image_path"])
-                        src_locations = detect_face_locations(face["image_path"])
-                        if src_locations:
-                            src_img = draw_face_boxes(src_img, src_locations)
-                        st.image(src_img, width="stretch")
-
-                    with col_matches:
-                        if face_matches:
-                            for m in face_matches:
-                                render_match_card(m)
-                                st.write("")
-                        else:
-                            st.info("No confident matches found.")
-
-    # Sidebar: scan controls (non-blocking for the main content)
-    with st.sidebar:
-        st.header("Scan Instagram")
-
-        scan_target = st.text_input("Username to search", value="aardvarkisrael", key="legacy_scan_target")
-
-        batch_size = st.number_input("Batch size", min_value=10, max_value=500, value=50, step=10)
-
-        if st.button("Scan Network", disabled=not scan_target):
-            progress_bar = st.progress(0, text="Starting scan...")
-            status_text = st.empty()
-            batch_text = st.empty()
-
-            def on_progress(current, total, username):
-                pct = current / max(total, 1)
-                progress_bar.progress(pct, text=f"Scanning {current}/{total}")
-                status_text.caption(f"@{username}")
-
-            def on_batch(batch_stats):
-                total_s = batch_stats["followers_scraped"] + batch_stats["following_scraped"]
-                batch_text.success(f"{total_s} scanned, {batch_stats['faces_found']} faces. Click 'Find Matches' now!")
-
-            try:
-                result = scrape_account(
-                    target_username=scan_target,
-                    batch_size=batch_size,
-                    progress_callback=on_progress,
-                    batch_callback=on_batch,
-                )
-                st.success(
-                    f"Done! {result['followers_scraped']} followers, "
-                    f"{result['following_scraped']} following. "
-                    f"{result['faces_found']} faces found."
-                )
-                if result.get("last_error"):
-                    st.warning(f"Scan ended early: {result['last_error']}")
-            except (ValueError, ConnectionError) as e:
-                st.error(str(e))
-            except Exception as e:
-                st.error(f"Scan failed: {type(e).__name__}: {e}")
-
-        cached = get_cached_stats()
-        if cached:
-            if cached.get("compatible", True):
-                st.caption(f"Cached: {cached['total']} profiles | {cached['with_face']} faces")
-            else:
-                st.caption(f"Cached: {cached['total']} profiles | reset required")
+                # Regular chat message — just display it
+                st.rerun()
 
 
-# ── Main: tab layout ───────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Tab layout — V3 (classic) + V4 (agent)
+# ---------------------------------------------------------------------------
+# --- UI ---
 
-tab1, tab2 = st.tabs(["V4 Investigation", "Legacy Scanner"])
+st.title("Instagram Face Matcher")
 
-with tab1:
+tab_v3, tab_v4 = st.tabs(["V3 Classic", "V4 Agent"])
+
+with tab_v3:
+    render_v3_ui()
+
+with tab_v4:
     render_v4_ui()
-
-with tab2:
-    render_legacy_ui()

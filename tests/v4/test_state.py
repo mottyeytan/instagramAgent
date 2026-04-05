@@ -21,9 +21,12 @@ from agents.state import (
 
 try:
     import sqlite_vec  # noqa: F401
-
+    # Also check if the extension can actually load (macOS may lack enable_load_extension)
+    _test_conn = sqlite3.connect(":memory:")
+    sqlite_vec.load(_test_conn)
+    _test_conn.close()
     HAS_SQLITE_VEC = True
-except ModuleNotFoundError:
+except Exception:
     HAS_SQLITE_VEC = False
 
 skip_no_vec = pytest.mark.skipif(

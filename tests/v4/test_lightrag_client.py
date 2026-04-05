@@ -1,6 +1,7 @@
-"""Tests for backend.lightrag_client -- all 12 tests run WITHOUT lightrag installed."""
+"""Tests for backend.lightrag_client -- 15 tests covering mock and real LightRAG."""
 
 import asyncio
+import inspect
 import logging
 import os
 import sqlite3
@@ -10,6 +11,7 @@ import types
 from unittest import mock
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import numpy as np
 import pytest
 
 # ---------------------------------------------------------------------------
@@ -41,6 +43,19 @@ class FakeLightRAG:
         return f"answer-to-{question}"
 
 
+class FakeEmbeddingFunc:
+    """Stand-in for lightrag.utils.EmbeddingFunc."""
+
+    def __init__(self, embedding_dim: int, func=None, **kwargs):
+        self.embedding_dim = embedding_dim
+        self.func = func
+
+    async def __call__(self, *args, **kwargs):
+        if self.func:
+            return await self.func(*args, **kwargs)
+        return np.zeros((1, self.embedding_dim))
+
+
 def _make_fake_lightrag_module(fake_cls=None):
     """Build a minimal fake `lightrag` package so the client can import it."""
     if fake_cls is None:
@@ -49,17 +64,18 @@ def _make_fake_lightrag_module(fake_cls=None):
     mod = types.ModuleType("lightrag")
     mod.LightRAG = fake_cls
 
-    # lightrag.llm sub-module (for QueryParam)
-    llm_mod = types.ModuleType("lightrag.llm")
-
     class FakeQueryParam:
         def __init__(self, mode="hybrid"):
             self.mode = mode
 
-    llm_mod.QueryParam = FakeQueryParam
-    mod.llm = llm_mod
+    mod.QueryParam = FakeQueryParam
 
-    return {"lightrag": mod, "lightrag.llm": llm_mod}
+    # lightrag.utils sub-module (for EmbeddingFunc)
+    utils_mod = types.ModuleType("lightrag.utils")
+    utils_mod.EmbeddingFunc = FakeEmbeddingFunc
+    mod.utils = utils_mod
+
+    return {"lightrag": mod, "lightrag.utils": utils_mod}
 
 
 def _fresh_import():
@@ -305,3 +321,71 @@ async def test_unavailable_client_methods_safe():
             assert await client.rebuild_from_evidence("/nonexistent.db") == 0
 
     sys.modules.update(saved)
+
+
+# ---------------------------------------------------------------------------
+# NEW: Real-integration & degradation tests
+# ---------------------------------------------------------------------------
+
+
+def test_real_lightrag_imports():
+    """13. Verify LightRAG and QueryParam can be imported from the real package (not mocked)."""
+    from lightrag import LightRAG as RealLightRAG
+    from lightrag import QueryParam as RealQueryParam
+    from lightrag.utils import EmbeddingFunc as RealEmbeddingFunc
+
+    assert RealLightRAG is not None
+    assert RealQueryParam is not None
+    assert RealEmbeddingFunc is not None
+    # Verify they are actual classes, not None stubs
+    assert callable(RealLightRAG)
+    assert callable(RealQueryParam)
+    assert callable(RealEmbeddingFunc)
+
+
+@pytest.mark.asyncio
+async def test_client_degrades_without_api_keys():
+    """14. Without OPENAI_API_KEY, client initializes (available=True) but insert
+    fails gracefully because the default LLM/embedding backends have no keys."""
+    fake_mods = _make_fake_lightrag_module()
+    with patch.dict(sys.modules, fake_mods):
+        mod = _fresh_import()
+        # Ensure both API keys are absent so auto_configure skips
+        with patch.dict(os.environ, {}, clear=True):
+            with tempfile.TemporaryDirectory() as td:
+                client = mod.LightRAGClient(working_dir=td, auto_configure=True)
+                # Client is still available (LightRAG itself initialised fine)
+                assert client.available is True
+                # The underlying FakeLightRAG works; the point is no API keys
+                # didn't crash init. Make insert fail to simulate real behaviour
+                # when the LLM/embedding backend has no key.
+                client._rag._should_fail_insert = True
+                result = await client.insert("some text", evidence_id=1)
+                assert result is False
+
+
+def test_create_llm_func_returns_callable():
+    """15. create_llm_func returns an async callable (mock the Anthropic client)."""
+    fake_mods = _make_fake_lightrag_module()
+    with patch.dict(sys.modules, fake_mods):
+        mod = _fresh_import()
+
+        # Build a mock Anthropic client
+        mock_response = MagicMock()
+        mock_response.content = [MagicMock(text="hello from Claude")]
+        mock_client = MagicMock()
+        mock_client.messages.create.return_value = mock_response
+
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-test-key"}):
+            with patch("anthropic.Anthropic", return_value=mock_client):
+                func = mod.create_llm_func()
+
+        # Verify it's an async callable
+        assert callable(func)
+        assert inspect.iscoroutinefunction(func)
+
+        # Call it and verify it delegates to the mock
+        loop = asyncio.get_event_loop()
+        result = loop.run_until_complete(func("test prompt"))
+        assert result == "hello from Claude"
+        mock_client.messages.create.assert_called_once()
