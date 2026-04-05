@@ -99,7 +99,9 @@ def context_load_node(state: GraphState) -> dict:
     except Exception:
         pass  # LightRAG not available — continue without context
 
-    writer({"event": "context_loaded", "embeddings_count": len(reference_embeddings)})
+    writer({"event": "log", "level": "system", "msg": f"Context loaded: {len(reference_embeddings)} reference embeddings"})
+    if lightrag_context:
+        writer({"event": "log", "level": "info", "msg": f"LightRAG context: {lightrag_context[:100]}..."})
 
     return {
         "reference_embeddings": reference_embeddings,
@@ -127,19 +129,68 @@ def seed_expansion_node(state: GraphState) -> dict:
 
     if seed_row:
         seed_username = seed_row["username"]
-        writer({"event": "seed_expansion_start", "username": seed_username})
+        writer({"event": "log", "level": "system", "msg": f"Seed expansion: @{seed_username}"})
+        writer({"event": "log", "level": "thinking", "msg": "Using Instagram API (Chrome cookies) to fetch followers/following..."})
 
-        # Run web search to find related profiles
+        # Use V1 scraper to get real followers with profile photo URLs
         try:
-            results = web_search(seed_username, investigation_id, db_path)
-            writer({
-                "event": "seed_expansion_complete",
-                "results_count": len(results),
-            })
+            from scraper import _get_session, _get_user_id, _get_followers_page
+            session = _get_session()
+            writer({"event": "log", "level": "result", "msg": "Instagram session authenticated via Chrome cookies"})
+
+            user_id, follower_count, following_count = _get_user_id(session, seed_username)
+            writer({"event": "log", "level": "info", "msg": f"@{seed_username}: {follower_count} followers, {following_count} following"})
+
+            # Fetch first page of followers (up to 50)
+            writer({"event": "log", "level": "tool_call", "msg": f"_get_followers_page(user_id={user_id}, count=50)"})
+            page = _get_followers_page(session, user_id, count=50)
+            users = page.get("users", [])
+            writer({"event": "log", "level": "result", "msg": f"Got {len(users)} followers from API"})
+
+            from agents.state import upsert_sighting
+            inserted = 0
+            for user in users:
+                uname = user.get("username", "")
+                if not uname:
+                    continue
+                pic_url = user.get("profile_pic_url", "")
+                full_name = user.get("full_name", "")
+
+                upsert_sighting(
+                    conn,
+                    investigation_id=investigation_id,
+                    username=uname,
+                    display_name=full_name,
+                    platform="instagram",
+                    profile_url=pic_url,  # THIS is the actual photo URL, not the page URL
+                    discovered_via="follower_list",
+                )
+                inserted += 1
+
+            conn.commit()
+            writer({"event": "log", "level": "result", "msg": f"Inserted {inserted} followers as leads with real photo URLs"})
+            writer({"event": "found_leads", "count": inserted, "platform": "instagram"})
+
+        except ConnectionError as exc:
+            writer({"event": "log", "level": "error", "msg": f"Instagram auth failed: {exc}. Make sure you're logged in to Chrome."})
         except Exception as exc:
-            writer({"event": "seed_expansion_error", "error": str(exc)})
+            writer({"event": "log", "level": "error", "msg": f"Instagram API error: {type(exc).__name__}: {exc}"})
+            # Fall back to web search
+            writer({"event": "log", "level": "thinking", "msg": "Falling back to web search..."})
+            try:
+                results = web_search(f"{seed_username} instagram", investigation_id, db_path)
+                writer({"event": "log", "level": "result", "msg": f"web_search returned {len(results)} results"})
+            except Exception:
+                pass
+
+        # Mark the seed sighting itself as rejected (it's the target, not a match candidate)
+        conn.execute(
+            "UPDATE sightings SET status = 'rejected' WHERE investigation_id = ? AND username = ? AND discovered_via = 'seed'",
+            (investigation_id, seed_username),
+        )
+        conn.commit()
     else:
-        writer({"event": "seed_expansion_skipped", "reason": "no_seed"})
+        writer({"event": "log", "level": "warning", "msg": "No seed username provided. Skipping expansion."})
 
     conn.close()
 
@@ -156,18 +207,18 @@ def pick_lead_node(state: GraphState) -> dict:
     conn.row_factory = sqlite3.Row
 
     lead = pick_next_lead(investigation_id, conn)
-    conn.close()
 
     if lead is None:
+        conn.close()
+        writer({"event": "log", "level": "decision", "msg": "No more eligible leads. Investigation complete."})
         writer({"event": "no_more_leads"})
         return {"current_action": "no_leads"}
 
     lead_dict = dict(lead)
-    writer({
-        "event": "lead_picked",
-        "sighting_id": lead_dict["id"],
-        "username": lead_dict.get("username", "unknown"),
-    })
+    priority = score_lead(lead_dict, conn)
+    conn.close()
+    writer({"event": "log", "level": "info", "msg": f"Selected: @{lead_dict.get('username', '?')} on {lead_dict.get('platform', '?')} (priority={priority:.1f}, status={lead_dict.get('status', '?')})"})
+    writer({"event": "investigating_lead", "username": lead_dict.get("username", "unknown"), "platform": lead_dict.get("platform", "?"), "priority": priority})
 
     return {"current_action": f"lead:{lead_dict['id']}"}
 
@@ -204,10 +255,12 @@ def dispatch_agent_node(state: GraphState) -> dict:
     sighting_dict = dict(sighting)
 
     # Transition to in_progress
+    writer({"event": "log", "level": "tool_call", "msg": f"transition_sighting({sighting_id}, 'in_progress')"})
     transition_sighting(conn, sighting_id, "in_progress")
 
     # Face verify if we have reference embeddings and a profile_url
     if reference_embeddings and sighting_dict.get("profile_url"):
+        writer({"event": "log", "level": "tool_call", "msg": f"face_verify(@{sighting_dict.get('username', '?')}, url={sighting_dict['profile_url'][:50]}...)"})
         result = face_verify(
             photo_url=sighting_dict["profile_url"],
             sighting_id=sighting_id,
@@ -258,12 +311,10 @@ def dispatch_agent_node(state: GraphState) -> dict:
             })
     else:
         # No embeddings or no profile_url — reject
+        reason = "no reference embeddings" if not reference_embeddings else f"no profile_url (have: {list(sighting_dict.keys())})"
+        writer({"event": "log", "level": "thinking", "msg": f"Cannot face verify @{sighting_dict.get('username', '?')}: {reason}. Marking rejected."})
         transition_sighting(conn, sighting_id, "rejected")
-        writer({
-            "event": "lead_rejected",
-            "sighting_id": sighting_id,
-            "reason": "no_embeddings_or_url",
-        })
+        writer({"event": "face_rejected", "username": sighting_dict.get("username", "?"), "score": 0})
 
     conn.close()
 

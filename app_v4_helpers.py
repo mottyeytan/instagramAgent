@@ -44,6 +44,17 @@ def check_backend_health(timeout: float = 3.0) -> bool:
         return False
 
 
+def resume_investigation(investigation_id: str, answer: str, timeout: float = 10.0) -> dict:
+    """POST the human's answer to resume a paused investigation."""
+    resp = httpx.post(
+        f"{BACKEND_URL}/investigations/{investigation_id}/resume",
+        json={"answer": answer},
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
 def format_event_display(event: dict) -> str:
     """Format an SSE event dict into a human-readable string for the activity feed."""
     etype = event.get("type", "unknown")

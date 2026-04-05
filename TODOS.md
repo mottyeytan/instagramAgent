@@ -10,5 +10,15 @@
 ## Curate demo account with ground-truth matches
 **What:** Pick a real Instagram account where you personally know 3-5 followers. Verify their profile photos have clear, recognizable faces. Collect photos of those people for demo input.
 **Why:** Without known-good matches, the demo is luck. With them, the reveal is guaranteed.
-**Do this BEFORE writing code.** It takes 30 minutes and determines whether the demo works.
+**Do this BEFORE running the real-account smoke test (Step 8).** Not blocking for fixture-based development.
 **Added:** 2026-04-01 via /plan-eng-review
+**Updated:** 2026-04-05 via /plan-eng-review (no longer step 0, moved to step 8)
+
+## Migrate to graph schema (V4.1 Phase 2)
+**What:** Migrate from sightings/evidence tables to graph_nodes/graph_edges schema as designed in the V4.1 design doc.
+**Why:** Graph schema enables cross-investigation memory, richer relationship modeling, and the action scorer's full potential. Deferred because migrating schema + orchestrator + API + tests simultaneously is too risky.
+**Pros:** Better data model, cross-investigation recognition, foundation for LightRAG
+**Cons:** Requires rewriting server.py endpoints, migrating test suite, handling SSE event contract
+**Context:** Full graph schema is designed in ~/.gstack/projects/mottyeytan-instagramAgent/mottyeytan-feat/v4-agent-system-design-20260405-172446.md. The incremental path (scorer on existing schema) proves the pattern first.
+**Depends on:** scorer + generate_candidates working on existing schema
+**Added:** 2026-04-05 via /plan-eng-review (Codex outside voice recommended incremental approach)

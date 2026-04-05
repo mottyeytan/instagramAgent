@@ -16,7 +16,9 @@ from app_v4_helpers import (
     check_backend_health,
     consume_sse_stream,
     format_event_display,
+    resume_investigation,
 )
+from backend.config import ORCHESTRATOR_BUDGET_USD
 
 INPUT_DIR = Path("data/input")
 
@@ -256,10 +258,49 @@ def _init_v4_session_state():
         st.session_state.v4_complete = False
 
 
-def _render_activity_event(event: dict):
-    """Render a single event in the activity feed column."""
-    etype = event.get("type", "unknown")
+LOG_STYLES = {
+    "system":    {"icon": "**>**", "color": "#4CAF50", "bold": True},
+    "thinking":  {"icon": "...", "color": "#9E9E9E", "bold": False},
+    "tool_call": {"icon": "$", "color": "#2196F3", "bold": True},
+    "result":    {"icon": "<-", "color": "#FF9800", "bold": True},
+    "decision":  {"icon": ">>", "color": "#E91E63", "bold": True},
+    "info":      {"icon": "i", "color": "#00BCD4", "bold": False},
+    "warning":   {"icon": "!", "color": "#FF5722", "bold": True},
+    "error":     {"icon": "X", "color": "#F44336", "bold": True},
+}
 
+
+def _render_activity_event(event: dict):
+    """Render a single event in the activity feed column — like a live agent terminal."""
+    etype = event.get("type", event.get("event", "unknown"))
+
+    # --- Log events (verbose agent trace) ---
+    if etype == "log":
+        level = event.get("level", "info")
+        msg = event.get("msg", "")
+        style = LOG_STYLES.get(level, LOG_STYLES["info"])
+        icon = style["icon"]
+        color = style["color"]
+
+        if level == "thinking":
+            st.markdown(f"<span style='color:{color};opacity:0.6;font-family:monospace;font-size:13px'>{icon} {msg}</span>", unsafe_allow_html=True)
+        elif level == "tool_call":
+            st.markdown(f"<span style='color:{color};font-family:monospace;font-size:13px'><b>{icon}</b> <code>{msg}</code></span>", unsafe_allow_html=True)
+        elif level == "result":
+            st.markdown(f"<span style='color:{color};font-family:monospace;font-size:13px'><b>{icon}</b> {msg}</span>", unsafe_allow_html=True)
+        elif level == "decision":
+            st.markdown(f"<span style='color:{color};font-family:monospace;font-size:13px'><b>{icon} {msg}</b></span>", unsafe_allow_html=True)
+        elif level == "error":
+            st.error(f"{msg}")
+        elif level == "warning":
+            st.warning(f"{msg}")
+        elif level == "system":
+            st.markdown(f"<span style='color:{color};font-weight:bold;font-family:monospace;font-size:14px'>{icon} {msg}</span>", unsafe_allow_html=True)
+        else:
+            st.markdown(f"<span style='color:{color};font-family:monospace;font-size:13px'>{icon} {msg}</span>", unsafe_allow_html=True)
+        return
+
+    # --- Structured events ---
     if etype == "scanning":
         username = event.get("username", "?")
         platform = event.get("platform", "instagram")
@@ -269,6 +310,12 @@ def _render_activity_event(event: dict):
         count = event.get("count", 0)
         platform = event.get("platform", "instagram")
         st.success(f"\U0001f4cb Found {count} leads on {platform}")
+
+    elif etype == "investigating_lead":
+        username = event.get("username", "?")
+        platform = event.get("platform", "?")
+        priority = event.get("priority", 0)
+        st.markdown(f"<span style='font-family:monospace;font-size:13px'>\U0001f50e Investigating <b>@{username}</b> on {platform} (priority: {priority:.1f})</span>", unsafe_allow_html=True)
 
     elif etype == "face_matched":
         username = event.get("username", "?")
@@ -285,42 +332,34 @@ def _render_activity_event(event: dict):
         username = event.get("username", "?")
         score = event.get("score", 0)
         st.markdown(
-            f"<span style='opacity:0.45'>\u274c @{username} ({score}%)</span>",
+            f"<span style='opacity:0.45;font-family:monospace;font-size:12px'>\u274c @{username} ({score}%)</span>",
             unsafe_allow_html=True,
         )
 
     elif etype == "budget_update":
         spent = event.get("spent", 0)
-        total = event.get("total", 1)
-        pct = min(spent / max(total, 1), 1.0)
-        st.progress(pct, text=f"Budget: {spent}/{total}")
+        remaining = event.get("remaining", ORCHESTRATOR_BUDGET_USD)
+        pct = min(spent / max(ORCHESTRATOR_BUDGET_USD, 0.01), 1.0)
+        st.progress(pct, text=f"Budget: ${spent:.3f} / ${ORCHESTRATOR_BUDGET_USD}")
+
+    elif etype == "budget_exceeded":
+        st.error(f"\U0001f4b8 Budget exceeded — ${event.get('spent', 0):.2f}")
+
+    elif etype == "no_more_leads":
+        st.info("\U0001f3c1 All leads processed")
 
     elif etype == "investigation_complete":
-        matches = event.get("matches_found", 0)
-        st.balloons()
-        st.success(f"\U0001f3c1 Investigation complete — {matches} matches found")
+        matches = event.get("matches", event.get("matches_found", 0))
+        total = event.get("total_leads", 0)
+        duration = event.get("duration_s", 0)
+        budget = event.get("budget_spent", 0)
+        st.success(f"\U0001f3c1 Done — {matches} matches from {total} leads in {duration}s (${budget:.3f})")
+
+    elif etype == "investigation_started":
+        st.markdown("<span style='color:#4CAF50;font-weight:bold;font-family:monospace'>Investigation started</span>", unsafe_allow_html=True)
 
     else:
         st.write(format_event_display(event))
-
-
-def _process_sse_events(events_iter):
-    """Consume an SSE event iterator, updating session state for each event."""
-    for event in events_iter:
-        st.session_state.v4_activity.append(event)
-        etype = event.get("type", "unknown")
-
-        if etype == "interrupt":
-            st.session_state.v4_waiting_interrupt = True
-            st.session_state.v4_interrupt_event = event
-            st.session_state.v4_chat.append(
-                {"role": "assistant", "content": event.get("question", "Agent needs input")}
-            )
-            # Stop consuming — we need user input before continuing
-            return
-
-        if etype == "investigation_complete":
-            st.session_state.v4_complete = True
 
 
 def render_v4_ui():
@@ -331,8 +370,7 @@ def render_v4_ui():
     if not backend_ok:
         st.warning(
             "V4 backend is not running. Click **Start Backend** in the sidebar, "
-            "or run `uvicorn backend.server:app --port 8000` manually. "
-            "Falling back to direct investigation mode."
+            "or run `uvicorn backend.server:app --port 8000` manually."
         )
 
     # --- Layout: left = activity feed, right = chat ---
@@ -346,7 +384,7 @@ def render_v4_ui():
         uploaded_files = st.file_uploader(
             "Upload reference photos",
             type=["jpg", "jpeg", "png"],
-            accept_multiple=True,
+            accept_multiple_files=True,
             key="v4_upload",
         )
 
@@ -375,25 +413,48 @@ def render_v4_ui():
                 st.session_state.v4_interrupt_event = None
                 st.session_state.v4_complete = False
 
-                inv_id = str(uuid.uuid4())
-                st.session_state.v4_investigation_id = inv_id
-
                 start_url = f"{BACKEND_URL}/investigations/start"
                 body = {
-                    "investigation_id": inv_id,
-                    "target_username": target,
+                    "target_description": target,
+                    "seed_username": target,
                     "photo_paths": photo_paths,
                 }
 
                 try:
-                    events = consume_sse_stream(start_url, json_body=body)
-                    _process_sse_events(events)
+                    # Stream events and render them live as they arrive
+                    feed = st.container()
+                    for event in consume_sse_stream(start_url, json_body=body):
+                        st.session_state.v4_activity.append(event)
+                        etype = event.get("event", event.get("type", "unknown"))
+
+                        with feed:
+                            _render_activity_event(event)
+
+                        if etype == "interrupt":
+                            st.session_state.v4_waiting_interrupt = True
+                            st.session_state.v4_interrupt_event = event
+                            st.session_state.v4_chat.append(
+                                {"role": "assistant", "content": event.get("question", "Agent needs input")}
+                            )
+                            st.rerun()
+                            return
+
+                        if etype == "investigation_complete":
+                            st.session_state.v4_complete = True
+
                 except Exception as exc:
                     st.error(f"Backend error: {exc}")
 
-        # Render accumulated events
-        for ev in st.session_state.v4_activity:
-            _render_activity_event(ev)
+        # Render previously accumulated events (on rerun after interrupt/etc.)
+        if st.session_state.v4_activity and not st.session_state.get("_v4_just_started"):
+            for ev in st.session_state.v4_activity:
+                _render_activity_event(ev)
+
+        # Show status
+        if st.session_state.v4_complete:
+            st.success("Investigation complete.")
+        elif st.session_state.v4_waiting_interrupt:
+            st.info("Agent is waiting for your input. Reply in the chat panel.")
 
     # ----- RIGHT: Chat Panel -----
     with col_chat:
@@ -409,24 +470,35 @@ def render_v4_ui():
         if user_input:
             st.session_state.v4_chat.append({"role": "user", "content": user_input})
 
-            if st.session_state.v4_waiting_interrupt and st.session_state.v4_investigation_id:
-                # Resume the investigation
-                inv_id = st.session_state.v4_investigation_id
-                resume_url = f"{BACKEND_URL}/investigations/{inv_id}/resume"
-                body = {"response": user_input}
-
-                st.session_state.v4_waiting_interrupt = False
-                st.session_state.v4_interrupt_event = None
-
+            if st.session_state.v4_waiting_interrupt:
+                # Resume the investigation — POST answer to backend to unblock agent
                 try:
-                    events = consume_sse_stream(resume_url, json_body=body)
-                    _process_sse_events(events)
+                    import httpx
+                    resp = httpx.get(f"{BACKEND_URL}/investigations/active", timeout=5)
+                    active = resp.json()
+                    if active.get("active") and active.get("investigation_id"):
+                        inv_id = active["investigation_id"]
+                        resume_investigation(inv_id, user_input)
+
+                        st.session_state.v4_waiting_interrupt = False
+                        st.session_state.v4_interrupt_event = None
+
+                        # Stream remaining events live
+                        # The resume endpoint just unblocks the agent;
+                        # the original SSE connection is gone after rerun.
+                        # We need to poll the DB for results instead.
+                        st.session_state.v4_chat.append(
+                            {"role": "assistant", "content": "Resuming investigation..."}
+                        )
+                    else:
+                        st.session_state.v4_chat.append(
+                            {"role": "assistant", "content": "No active investigation to resume."}
+                        )
                 except Exception as exc:
-                    st.error(f"Backend error: {exc}")
+                    st.error(f"Resume error: {exc}")
 
                 st.rerun()
             else:
-                # Regular chat message — just display it
                 st.rerun()
 
 

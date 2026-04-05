@@ -8,29 +8,26 @@ Provides:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
+import threading
 import uuid
 from typing import AsyncGenerator
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 
-from agents.orchestrator import check_budget, pick_next_lead, update_budget, transition_sighting
-from agents.state import init_db
-from backend.config import DB_PATH, PHOTOS_DIR, DEFAULT_TIME_LIMIT_MINUTES
-from backend.models import ResumeRequest, SSEEvent, StartRequest
+import numpy as np
 
-try:
-    from backend.graph import build_graph, GraphState
-    _GRAPH_AVAILABLE = True
-except Exception:
-    _GRAPH_AVAILABLE = False
+from agents.state import init_db
+from agents.agent_brain import run_agent_loop, HumanInterrupt
+from backend.config import DB_PATH, PHOTOS_DIR, DEFAULT_TIME_LIMIT_MINUTES, ORCHESTRATOR_BUDGET_USD
+from backend.models import ResumeRequest, SSEEvent, StartRequest
 
 try:
     from encoder import encode_primary_face
 except (ImportError, ModuleNotFoundError):
-    # insightface or other heavy deps not installed — provide a stub
     def encode_primary_face(image_path: str) -> list:  # type: ignore[misc]
         return []
 
@@ -39,6 +36,12 @@ except (ImportError, ModuleNotFoundError):
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="instagramAgent V4", version="4.0.0")
+
+# ---------------------------------------------------------------------------
+# Active investigation state (in-process; single-worker assumption)
+# ---------------------------------------------------------------------------
+
+_active_investigations: dict[str, HumanInterrupt] = {}
 
 # ---------------------------------------------------------------------------
 # Dependencies
@@ -69,97 +72,6 @@ def _format_sse(event: SSEEvent) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Investigation loop (simplified V1 — no LangGraph)
-# ---------------------------------------------------------------------------
-
-SIMULATED_COST_PER_LEAD = 0.005  # fake cost per lead for budget tracking
-
-
-async def run_investigation(
-    investigation_id: str, db_path: str
-) -> AsyncGenerator[SSEEvent, None]:
-    """Run a simplified investigation loop, yielding SSE events.
-
-    Processes leads one-by-one, checking budget each iteration.
-    """
-    conn = init_db(db_path)
-    conn.row_factory = sqlite3.Row
-
-    yield SSEEvent(event="investigation_started", data={"investigation_id": investigation_id})
-
-    while True:
-        budget = check_budget(investigation_id, conn)
-        if budget["over_budget"]:
-            yield SSEEvent(event="budget_exceeded", data=budget)
-            break
-
-        lead = pick_next_lead(investigation_id, conn)
-        if not lead:
-            yield SSEEvent(event="no_more_leads", data={})
-            break
-
-        lead_dict = dict(lead)
-        yield SSEEvent(
-            event="investigating_lead",
-            data={"username": lead_dict.get("username", "unknown")},
-        )
-
-        # Simulate processing: transition to in_progress then verified
-        transition_sighting(conn, lead_dict["id"], "in_progress")
-
-        # Simulate LLM cost
-        update_budget(investigation_id, conn, input_tokens=500, output_tokens=200)
-
-        transition_sighting(conn, lead_dict["id"], "verified")
-
-        yield SSEEvent(
-            event="lead_processed",
-            data={
-                "username": lead_dict.get("username", "unknown"),
-                "status": "verified",
-            },
-        )
-
-    # Mark investigation completed
-    conn.execute(
-        "UPDATE investigations SET status = 'completed', "
-        "finished_at = datetime('now') WHERE id = ?",
-        (investigation_id,),
-    )
-    conn.commit()
-    conn.close()
-
-    yield SSEEvent(event="investigation_complete", data={})
-
-
-async def run_resume(
-    investigation_id: str, db_path: str, answer: str
-) -> AsyncGenerator[SSEEvent, None]:
-    """Resume an investigation, yielding SSE events."""
-    conn = init_db(db_path)
-    conn.row_factory = sqlite3.Row
-
-    yield SSEEvent(event="investigation_resumed", data={
-        "investigation_id": investigation_id,
-        "answer": answer,
-    })
-
-    # Update status back to running
-    conn.execute(
-        "UPDATE investigations SET status = 'running' WHERE id = ?",
-        (investigation_id,),
-    )
-    conn.commit()
-
-    # Continue the investigation loop
-    async for event in run_investigation(investigation_id, db_path):
-        # Skip the investigation_started event since we already sent resumed
-        if event.event == "investigation_started":
-            continue
-        yield event
-
-
-# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
@@ -170,13 +82,20 @@ async def start_investigation(
 ):
     """Start a new investigation. Returns SSE stream of events.
 
-    Uses the real LangGraph graph when available, falls back to the
-    simplified loop otherwise.
+    Runs the real Claude-powered agent brain with tool calling.
+    Events stream back via SSE in real-time.
 
     409 Conflict if an investigation is already running.
     """
     conn = init_db(db_path)
     conn.row_factory = sqlite3.Row
+
+    # Auto-clean stale investigations (running for >10 min = probably crashed)
+    conn.execute(
+        "UPDATE investigations SET status = 'error' "
+        "WHERE status = 'running' AND started_at < datetime('now', '-10 minutes')"
+    )
+    conn.commit()
 
     # Check for already-running investigation
     running = conn.execute(
@@ -195,12 +114,13 @@ async def start_investigation(
     conn.commit()
 
     # Insert target photos with embeddings
+    reference_embeddings = []
     for photo_path in request.photo_paths:
         embeddings = encode_primary_face(photo_path)
         emb_blob = None
         if embeddings:
-            import numpy as np
             emb_blob = embeddings[0].tobytes()
+            reference_embeddings.append(embeddings[0])
         conn.execute(
             "INSERT INTO target_photos (investigation_id, photo_path, face_embedding) "
             "VALUES (?, ?, ?)",
@@ -220,41 +140,53 @@ async def start_investigation(
 
     conn.close()
 
-    # Try LangGraph-based execution
-    if _GRAPH_AVAILABLE:
-        graph = build_graph()
-        initial_state: GraphState = {
-            "investigation_id": inv_id,
-            "target_description": request.target_description,
-            "reference_embeddings": [],
-            "db_path": db_path,
-            "photos_dir": str(PHOTOS_DIR),
-            "time_limit_s": (request.time_limit_minutes or DEFAULT_TIME_LIMIT_MINUTES) * 60.0,
-            "start_time": 0.0,
-            "lightrag_context": "",
-            "current_action": "",
-        }
-        config = {"configurable": {"thread_id": inv_id}}
+    # Set up interrupt mechanism and event queue
+    interrupt = HumanInterrupt()
+    _active_investigations[inv_id] = interrupt
+    queue: asyncio.Queue[dict | None] = asyncio.Queue()
+    loop = asyncio.get_event_loop()
 
-        async def _graph_stream():
-            async for chunk in graph.astream(
-                initial_state, config=config, stream_mode=["custom", "values"]
-            ):
-                # Custom events come as tuples ("custom", data)
-                if isinstance(chunk, tuple) and len(chunk) == 2:
-                    mode, data = chunk
-                    if mode == "custom" and isinstance(data, dict):
-                        event = SSEEvent(event=data.get("event", "update"), data=data)
-                        yield _format_sse(event)
+    def on_event(event: dict):
+        """Push events from the sync agent thread into the async queue."""
+        loop.call_soon_threadsafe(queue.put_nowait, event)
 
-        return StreamingResponse(_graph_stream(), media_type="text/event-stream")
+    def _run_agent():
+        """Run the agent loop in a background thread."""
+        try:
+            run_agent_loop(
+                investigation_id=inv_id,
+                target_description=request.target_description,
+                seed_username=request.seed_username or request.target_description,
+                reference_embeddings=reference_embeddings,
+                db_path=db_path,
+                on_event=on_event,
+                human_interrupt=interrupt,
+            )
+        except Exception as exc:
+            on_event({"event": "log", "level": "error", "msg": f"Agent crashed: {type(exc).__name__}: {exc}"})
+        finally:
+            # Signal end-of-stream
+            loop.call_soon_threadsafe(queue.put_nowait, None)
+            _active_investigations.pop(inv_id, None)
 
-    # Fallback to simplified loop
+    # Launch agent in a thread
+    agent_thread = threading.Thread(target=_run_agent, daemon=True)
+    agent_thread.start()
+
     async def _stream():
-        async for event in run_investigation(inv_id, db_path):
-            yield _format_sse(event)
+        """Async generator that drains the queue as SSE events."""
+        while True:
+            event = await queue.get()
+            if event is None:
+                break
+            sse = SSEEvent(event=event.get("event", "update"), data=event)
+            yield _format_sse(sse)
 
-    return StreamingResponse(_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        _stream(),
+        media_type="text/event-stream",
+        headers={"X-Investigation-Id": inv_id},
+    )
 
 
 @app.post("/investigations/{investigation_id}/resume")
@@ -263,12 +195,12 @@ async def resume_investigation(
     request: ResumeRequest,
     db_path: str = Depends(_get_db_path),
 ):
-    """Resume an investigation. Returns SSE stream of resumed events.
+    """Resume an investigation by providing the human's answer.
 
-    Uses the LangGraph graph with Command(resume=answer) when available,
-    falls back to the simplified loop otherwise.
+    The agent thread is blocked waiting for input — this endpoint
+    unblocks it and the existing SSE stream continues flowing.
 
-    404 if investigation not found.
+    404 if investigation not found, 409 if not waiting for input.
     """
     conn = init_db(db_path)
     row = conn.execute(
@@ -279,33 +211,24 @@ async def resume_investigation(
     if not row:
         raise HTTPException(status_code=404, detail="Investigation not found")
 
-    # Try LangGraph-based resume
-    if _GRAPH_AVAILABLE:
-        from langgraph.types import Command
+    interrupt = _active_investigations.get(investigation_id)
+    if not interrupt:
+        raise HTTPException(
+            status_code=409,
+            detail="Investigation is not running or not waiting for input",
+        )
 
-        graph = build_graph()
-        config = {"configurable": {"thread_id": investigation_id}}
+    interrupt.resume(request.answer)
+    return {"status": "resumed", "investigation_id": investigation_id}
 
-        async def _graph_resume_stream():
-            async for chunk in graph.astream(
-                Command(resume=request.answer),
-                config=config,
-                stream_mode=["custom", "values"],
-            ):
-                if isinstance(chunk, tuple) and len(chunk) == 2:
-                    mode, data = chunk
-                    if mode == "custom" and isinstance(data, dict):
-                        event = SSEEvent(event=data.get("event", "update"), data=data)
-                        yield _format_sse(event)
 
-        return StreamingResponse(_graph_resume_stream(), media_type="text/event-stream")
-
-    # Fallback to simplified loop
-    async def _stream():
-        async for event in run_resume(investigation_id, db_path, request.answer):
-            yield _format_sse(event)
-
-    return StreamingResponse(_stream(), media_type="text/event-stream")
+@app.get("/investigations/active")
+async def active_investigation():
+    """Return the ID of the currently active investigation, if any."""
+    ids = list(_active_investigations.keys())
+    if not ids:
+        return {"active": False, "investigation_id": None}
+    return {"active": True, "investigation_id": ids[0]}
 
 
 @app.get("/health")
