@@ -1,0 +1,52 @@
+[
+  {
+    "url": "https://linkedin.com/in/yoav-levi-photography",
+    "title": "Yoav Levi - Freelance Photographer - Self-employed",
+    "snippet": "Tel Aviv based freelance photographer specializing in street photography and portraiture. Previously at Haaretz daily newspaper photo desk."
+  },
+  {
+    "url": "https://www.eyalbendavid.com",
+    "title": "Eyal Ben David | Documentary Photography",
+    "snippet": "Documentary and editorial photographer based in Florentin, Tel Aviv. Clients include Walla, Calcalist, and Time Out Israel."
+  },
+  {
+    "url": "https://linkedin.com/in/noa-cohen-dev",
+    "title": "Noa Cohen - Full Stack Developer - Wix.com",
+    "snippet": "Software engineer at Wix, Tel Aviv. React, Node.js, Python. Bezalel Academy of Arts graduate. Building design tools for the web."
+  },
+  {
+    "url": "https://www.facebook.com/shira.bar.photography",
+    "title": "Shira Bar Photography",
+    "snippet": "Event and wedding photographer serving Tel Aviv, Haifa, and Jerusalem. Over 200 weddings captured since 2018. Book your session today."
+  },
+  {
+    "url": "https://rotem-aharoni.medium.com",
+    "title": "Rotem Aharoni - Medium",
+    "snippet": "Thoughts on computational photography, AI image processing, and the future of visual media. Currently building CV tools at a Tel Aviv startup."
+  },
+  {
+    "url": "https://twitter.com/maya_goldstein_",
+    "title": "Maya Goldstein (@maya_goldstein_) / X",
+    "snippet": "UX researcher at Check Point Software. Interested in human-computer interaction, design systems, and generative AI. Ramat Gan."
+  },
+  {
+    "url": "https://www.haaretz.com/israel-news/2025-12-15/yoav-levi-photo-exhibition",
+    "title": "Tel Aviv Photographer Yoav Levi Opens Solo Exhibition at Beit Ha'ir",
+    "snippet": "The exhibition, titled 'Faces of Florentin,' features 40 portraits taken over two years in one of Tel Aviv's most iconic neighborhoods."
+  },
+  {
+    "url": "https://github.com/danieloren",
+    "title": "Daniel Oren (danieloren) - GitHub",
+    "snippet": "Backend engineer. Python, Go, Kubernetes. Open source contributor. Based in Tel Aviv. Working on distributed systems at Monday.com."
+  },
+  {
+    "url": "https://www.instagram.com/p/fake_inbal_studio_feature",
+    "title": "Inbal Segev Studio - Featured in Timeout Tel Aviv",
+    "snippet": "Portrait and commercial photography studio in Neve Tzedek. Named one of Tel Aviv's top 10 photography studios by Time Out TLV 2025."
+  },
+  {
+    "url": "https://linkedin.com/in/omer-katz-ml",
+    "title": "Omer Katz - Machine Learning Engineer - Mobileye",
+    "snippet": "Computer vision engineer at Mobileye, Jerusalem. Specializing in object detection and image segmentation. Technion CS graduate."
+  }
+]
