@@ -46,5 +46,9 @@ MAX_ACTIONS_PER_PLATFORM = 30
 LIGHTRAG_EMBEDDING_DIM = 3072
 LIGHTRAG_EMBEDDING_MODEL = "text-embedding-3-large"
 
+# Model configuration
+HAIKU_MODEL = "claude-haiku-4-5-20251001"
+SONNET_MODEL = "claude-sonnet-4-20250514"
+
 # Pipeline
 PIPELINE_VERSION = "3"

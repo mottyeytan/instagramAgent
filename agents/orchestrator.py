@@ -10,7 +10,17 @@ from __future__ import annotations
 import sqlite3
 
 from agents.state import MAX_RETRIES, RETRYABLE_STATES, TERMINAL_STATES
-from backend.config import BUDGET_WARNING_THRESHOLD, ORCHESTRATOR_BUDGET_USD
+from backend.config import BUDGET_WARNING_THRESHOLD, ORCHESTRATOR_BUDGET_USD, SONNET_MODEL, HAIKU_MODEL
+
+
+# ---------------------------------------------------------------------------
+# Model pricing (per million tokens, as of 2026)
+# ---------------------------------------------------------------------------
+
+MODEL_PRICING = {
+    HAIKU_MODEL: {"input": 1.0, "output": 5.0},
+    SONNET_MODEL: {"input": 3.0, "output": 15.0},
+}
 
 
 # ---------------------------------------------------------------------------
@@ -133,12 +143,14 @@ def update_budget(
     conn: sqlite3.Connection,
     input_tokens: int,
     output_tokens: int,
+    model: str = SONNET_MODEL,
 ) -> None:
-    """Track LLM cost after each call.
+    """Track LLM cost after each call with model-aware pricing.
 
-    Cost formula: (input_tokens * 3 + output_tokens * 15) / 1_000_000
+    Defaults to Sonnet pricing for backwards compatibility.
     """
-    cost = (input_tokens * 3 + output_tokens * 15) / 1_000_000
+    pricing = MODEL_PRICING.get(model, MODEL_PRICING[SONNET_MODEL])
+    cost = (input_tokens * pricing["input"] / 1_000_000) + (output_tokens * pricing["output"] / 1_000_000)
     conn.execute(
         "UPDATE investigations SET llm_cost_usd = llm_cost_usd + ?, "
         "llm_tokens_used = llm_tokens_used + ? WHERE id = ?",
