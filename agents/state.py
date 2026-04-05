@@ -108,11 +108,26 @@ CREATE TABLE IF NOT EXISTS platform_state (
     PRIMARY KEY (investigation_id, platform)
 );
 
+CREATE TABLE IF NOT EXISTS action_log (
+    id INTEGER PRIMARY KEY,
+    investigation_id TEXT NOT NULL,
+    action_type TEXT NOT NULL,
+    target_username TEXT,
+    action_params JSON,
+    score REAL,
+    result_summary TEXT,
+    nodes_created INTEGER DEFAULT 0,
+    cost_usd REAL DEFAULT 0,
+    duration_ms INTEGER,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_sightings_investigation ON sightings(investigation_id);
 CREATE INDEX IF NOT EXISTS idx_sightings_status ON sightings(status);
 CREATE INDEX IF NOT EXISTS idx_sightings_compiled ON sightings(compiled_at);
 CREATE INDEX IF NOT EXISTS idx_evidence_sighting ON evidence(sighting_id);
 CREATE INDEX IF NOT EXISTS idx_evidence_investigation ON evidence(investigation_id);
+CREATE INDEX IF NOT EXISTS idx_action_log_investigation ON action_log(investigation_id);
 """
 
 _FACE_VECTORS_SQL = (
