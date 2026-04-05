@@ -1,0 +1,22 @@
+[
+  {"username": "yoav_levi_92", "match": true, "face_match_score": 0.87, "status": "verified", "det_score": 0.99},
+  {"username": "eyal_ben_david", "match": true, "face_match_score": 0.82, "status": "verified", "det_score": 0.97},
+  {"username": "rotem_photography", "match": true, "face_match_score": 0.74, "status": "verified", "det_score": 0.96},
+  {"username": "noa_cohen_88", "match": false, "face_match_score": 0.68, "status": "possible", "needs_interrupt": true, "det_score": 0.95},
+  {"username": "shira_bar_photo", "match": false, "face_match_score": 0.62, "status": "possible", "needs_interrupt": true, "det_score": 0.93},
+  {"username": "maya_goldstein", "match": false, "face_match_score": 0.55, "status": "possible", "needs_interrupt": true, "det_score": 0.91},
+  {"username": "omer.katz", "match": false, "face_match_score": 0.51, "status": "possible", "needs_interrupt": true, "det_score": 0.88},
+  {"username": "idan_mizrahi", "match": false, "face_match_score": 0.45, "status": "rejected", "det_score": 0.94},
+  {"username": "tamar_dayan_tlv", "match": false, "face_match_score": 0.38, "status": "rejected", "det_score": 0.92},
+  {"username": "liron.shapira", "match": false, "face_match_score": 0.33, "status": "rejected", "det_score": 0.90},
+  {"username": "daniel_oren_dev", "match": false, "face_match_score": 0.29, "status": "rejected", "det_score": 0.89},
+  {"username": "gal_avraham", "match": false, "face_match_score": 0.22, "status": "rejected", "det_score": 0.87},
+  {"username": "or_peleg_95", "match": false, "face_match_score": 0.18, "status": "rejected", "det_score": 0.93},
+  {"username": "yael_klein", "match": false, "face_match_score": 0.15, "status": "rejected", "det_score": 0.86},
+  {"username": "amit_rabin", "match": false, "face_match_score": 0.12, "status": "rejected", "det_score": 0.91},
+  {"username": "dana_haim", "match": false, "face_match_score": 0.09, "status": "rejected", "det_score": 0.85},
+  {"username": "ofir_nachman", "match": false, "face_match_score": 0.05, "status": "rejected", "det_score": 0.88},
+  {"username": "noam_tsur_3", "match": false, "face_match_score": 0.0, "status": "no_face", "det_score": 0.0},
+  {"username": "lee_simchi", "match": false, "face_match_score": 0.0, "status": "no_face", "det_score": 0.0},
+  {"username": "asaf_peretz", "match": false, "face_match_score": 0.0, "status": "no_face", "det_score": 0.0}
+]

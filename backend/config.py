@@ -1,0 +1,54 @@
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Paths
+PROJECT_ROOT = Path(__file__).parent.parent
+DATA_DIR = PROJECT_ROOT / "data"
+DB_PATH = DATA_DIR / "faces.db"
+CHECKPOINT_DB_PATH = DATA_DIR / "checkpoint.db"
+LIGHTRAG_DIR = DATA_DIR / "lightrag"
+PHOTOS_DIR = DATA_DIR / "photos"
+REPORTS_DIR = DATA_DIR / "reports"
+WIKI_DIR = PROJECT_ROOT / "wiki"
+COOKIES_PATH = DATA_DIR / "cookies.json"
+
+# API Keys
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+
+# Budget
+ORCHESTRATOR_BUDGET_USD = 4.0
+POST_PROCESSING_BUDGET_USD = 1.0
+TOTAL_BUDGET_USD = 5.0
+MIN_POST_PROCESSING_BUDGET_USD = 0.50
+BUDGET_WARNING_THRESHOLD = 0.80  # interrupt at 80%
+
+# Investigation
+DEFAULT_TIME_LIMIT_MINUTES = 10
+MAX_TIME_LIMIT_MINUTES = 30
+MAX_RETRIES_PER_SIGHTING = 2
+
+# Face matching
+FACE_MATCH_THRESHOLD_PROFILE = 0.70
+FACE_MATCH_THRESHOLD_GROUP = 0.5
+FACE_MATCH_BORDERLINE_LOW = 0.50
+FACE_MATCH_BORDERLINE_HIGH = 0.65
+
+# Browser
+BROWSER_DELAY_MIN_S = 2
+BROWSER_DELAY_MAX_S = 8
+MAX_ACTIONS_PER_PLATFORM = 30
+
+# LightRAG
+LIGHTRAG_EMBEDDING_DIM = 3072
+LIGHTRAG_EMBEDDING_MODEL = "text-embedding-3-large"
+
+# Model configuration
+HAIKU_MODEL = "claude-haiku-4-5-20251001"
+SONNET_MODEL = "claude-sonnet-4-20250514"
+
+# Pipeline
+PIPELINE_VERSION = "3"

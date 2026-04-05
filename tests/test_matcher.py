@@ -81,7 +81,7 @@ class TestFindMatches:
         return tmp.name
 
     def test_match_found(self):
-        base = np.random.randn(512).astype(np.float64)
+        base = np.random.randn(512).astype(np.float32)
         base = base / np.linalg.norm(base)
         # Create a nearby vector (should match)
         noise = np.random.randn(512) * 0.01
@@ -97,7 +97,7 @@ class TestFindMatches:
         assert matches[0][0].confidence > 0
 
     def test_no_match_found(self):
-        base = np.random.randn(512).astype(np.float64)
+        base = np.random.randn(512).astype(np.float32)
         base = base / np.linalg.norm(base)
         # Create a very different vector
         different = -base
@@ -127,14 +127,14 @@ class TestFindMatches:
         conn.commit()
         conn.close()
 
-        emb = np.random.randn(512).astype(np.float64)
+        emb = np.random.randn(512).astype(np.float32)
         matches = find_matches([emb], tmp.name)
 
         assert len(matches) == 1
         assert len(matches[0]) == 0
 
     def test_nonexistent_database(self):
-        emb = np.random.randn(512).astype(np.float64)
+        emb = np.random.randn(512).astype(np.float32)
         matches = find_matches([emb], "/tmp/nonexistent_test.db")
 
         assert len(matches) == 1

@@ -10,3 +10,5 @@ build/
 .streamlit/
 venv/
 .DS_Store
+.claude/worktrees/
+.gstack/

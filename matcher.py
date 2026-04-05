@@ -27,8 +27,8 @@ def cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
     norm_b = np.linalg.norm(b)
     if norm_a == 0 or norm_b == 0:
         return 1.0
-    similarity = dot / (norm_a * norm_b)
-    return 1.0 - float(similarity)
+    similarity = np.clip(dot / (norm_a * norm_b), -1.0, 1.0)
+    return max(0.0, 1.0 - float(similarity))
 
 
 def distance_to_confidence(distance: float) -> float:
@@ -72,7 +72,7 @@ def find_matches(
     # Load all profile embeddings
     profile_data = []
     for row in rows:
-        embedding = np.frombuffer(row["encoding"], dtype=np.float64)
+        embedding = np.frombuffer(row["encoding"], dtype=np.float32)
         profile_data.append({
             "username": row["username"],
             "full_name": row["full_name"],
