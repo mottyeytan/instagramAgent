@@ -31,7 +31,7 @@ class TestSmokeFullPipeline:
         """)
 
         np.random.seed(42)
-        known_embedding = np.random.randn(512).astype(np.float64)
+        known_embedding = np.random.randn(512).astype(np.float32)
         known_embedding = known_embedding / np.linalg.norm(known_embedding)
 
         profiles = [
@@ -44,7 +44,7 @@ class TestSmokeFullPipeline:
 
         for username, name, rel, emb in profiles:
             if emb is None:
-                emb = np.random.randn(512).astype(np.float64)
+                emb = np.random.randn(512).astype(np.float32)
                 emb = emb / np.linalg.norm(emb)
 
             conn.execute(
@@ -82,7 +82,7 @@ class TestSmokeFullPipeline:
         db_path, _ = self._build_canned_db()
 
         np.random.seed(999)
-        random_query = np.random.randn(512).astype(np.float64)
+        random_query = np.random.randn(512).astype(np.float32)
         random_query = random_query / np.linalg.norm(random_query)
 
         matches = find_matches([random_query], db_path, threshold=0.3)
@@ -101,7 +101,7 @@ class TestSmokeFullPipeline:
         query1 = query1 / np.linalg.norm(query1)
 
         np.random.seed(123)
-        query2 = np.random.randn(512).astype(np.float64)
+        query2 = np.random.randn(512).astype(np.float32)
         query2 = query2 / np.linalg.norm(query2)
 
         matches = find_matches([query1, query2], db_path)

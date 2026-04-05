@@ -24,7 +24,7 @@ except ImportError:
 DATA_DIR = Path("data")
 PHOTOS_DIR = DATA_DIR / "photos"
 DB_PATH = DATA_DIR / "faces.db"
-PIPELINE_VERSION = "2"
+PIPELINE_VERSION = "3"
 
 DELAY_MIN = 3
 DELAY_MAX = 6
