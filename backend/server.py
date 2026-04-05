@@ -18,8 +18,14 @@ from fastapi.responses import StreamingResponse
 
 from agents.orchestrator import check_budget, pick_next_lead, update_budget, transition_sighting
 from agents.state import init_db
-from backend.config import DB_PATH
+from backend.config import DB_PATH, PHOTOS_DIR, DEFAULT_TIME_LIMIT_MINUTES
 from backend.models import ResumeRequest, SSEEvent, StartRequest
+
+try:
+    from backend.graph import build_graph, GraphState
+    _GRAPH_AVAILABLE = True
+except Exception:
+    _GRAPH_AVAILABLE = False
 
 try:
     from encoder import encode_primary_face
@@ -164,6 +170,9 @@ async def start_investigation(
 ):
     """Start a new investigation. Returns SSE stream of events.
 
+    Uses the real LangGraph graph when available, falls back to the
+    simplified loop otherwise.
+
     409 Conflict if an investigation is already running.
     """
     conn = init_db(db_path)
@@ -211,6 +220,36 @@ async def start_investigation(
 
     conn.close()
 
+    # Try LangGraph-based execution
+    if _GRAPH_AVAILABLE:
+        graph = build_graph()
+        initial_state: GraphState = {
+            "investigation_id": inv_id,
+            "target_description": request.target_description,
+            "reference_embeddings": [],
+            "db_path": db_path,
+            "photos_dir": str(PHOTOS_DIR),
+            "time_limit_s": (request.time_limit_minutes or DEFAULT_TIME_LIMIT_MINUTES) * 60.0,
+            "start_time": 0.0,
+            "lightrag_context": "",
+            "current_action": "",
+        }
+        config = {"configurable": {"thread_id": inv_id}}
+
+        async def _graph_stream():
+            async for chunk in graph.astream(
+                initial_state, config=config, stream_mode=["custom", "values"]
+            ):
+                # Custom events come as tuples ("custom", data)
+                if isinstance(chunk, tuple) and len(chunk) == 2:
+                    mode, data = chunk
+                    if mode == "custom" and isinstance(data, dict):
+                        event = SSEEvent(event=data.get("event", "update"), data=data)
+                        yield _format_sse(event)
+
+        return StreamingResponse(_graph_stream(), media_type="text/event-stream")
+
+    # Fallback to simplified loop
     async def _stream():
         async for event in run_investigation(inv_id, db_path):
             yield _format_sse(event)
@@ -226,6 +265,9 @@ async def resume_investigation(
 ):
     """Resume an investigation. Returns SSE stream of resumed events.
 
+    Uses the LangGraph graph with Command(resume=answer) when available,
+    falls back to the simplified loop otherwise.
+
     404 if investigation not found.
     """
     conn = init_db(db_path)
@@ -237,6 +279,28 @@ async def resume_investigation(
     if not row:
         raise HTTPException(status_code=404, detail="Investigation not found")
 
+    # Try LangGraph-based resume
+    if _GRAPH_AVAILABLE:
+        from langgraph.types import Command
+
+        graph = build_graph()
+        config = {"configurable": {"thread_id": investigation_id}}
+
+        async def _graph_resume_stream():
+            async for chunk in graph.astream(
+                Command(resume=request.answer),
+                config=config,
+                stream_mode=["custom", "values"],
+            ):
+                if isinstance(chunk, tuple) and len(chunk) == 2:
+                    mode, data = chunk
+                    if mode == "custom" and isinstance(data, dict):
+                        event = SSEEvent(event=data.get("event", "update"), data=data)
+                        yield _format_sse(event)
+
+        return StreamingResponse(_graph_resume_stream(), media_type="text/event-stream")
+
+    # Fallback to simplified loop
     async def _stream():
         async for event in run_resume(investigation_id, db_path, request.answer):
             yield _format_sse(event)
